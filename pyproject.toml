@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.10,<1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tirtc"
+version = "2.4.0"
+description = "TiRTC headless RTC and Ti Cloud Storage SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "tange.ai" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Communications",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Homepage = "https://github.com/tangeai/tirtc-client-python"
+Repository = "https://github.com/tangeai/tirtc-client-python"
+
+[tool.scikit-build]
+cmake.version = ">=3.26"
+wheel.packages = ["src/tirtc"]
+wheel.py-api = "cp311"
+wheel.platlib = true
+sdist.exclude = [".build", "tool", "tests"]
