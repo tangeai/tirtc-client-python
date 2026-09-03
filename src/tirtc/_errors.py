@@ -149,6 +149,14 @@ class RecordingUnreadableError(TiRTCError):
     __slots__ = ()
 
 
+class RecordingNotFoundError(TiRTCError):
+    __slots__ = ()
+
+
+class RecordingDownloadFailedError(TiRTCError):
+    __slots__ = ()
+
+
 class UnavailableError(TiRTCError):
     __slots__ = ()
 
@@ -202,6 +210,8 @@ _ERROR_TYPES: dict[int, type[TiRTCError]] = {
     6131: LogUploadError,
     6132: LogUploadError,
     6133: LogUploadError,
+    6134: RecordingNotFoundError,
+    6135: RecordingDownloadFailedError,
 }
 
 
