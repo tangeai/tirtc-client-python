@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from contextlib import ExitStack
-from datetime import datetime, timedelta, timezone
-import math
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shutil
@@ -18,6 +18,7 @@ import tirtc.storage as storage
 
 MAXIMUM_MEDIA_FILE_SIZE = 512 << 20
 MINIMUM_RECORDING_SECONDS = 3.0
+RESOURCE_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 class Signals:
@@ -49,7 +50,7 @@ class Signals:
                 self._counts.get(name, 0) <= baseline.get(name, 0) for name in names
             ):
                 if self._failure is not None:
-                    raise self._failure
+                    raise RuntimeError("playback output failed") from self._failure
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     missing = [
@@ -84,8 +85,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--start-ms must be non-negative and earlier than --end-ms")
     if not 0 <= args.audio_channel_id <= 255 or not 0 <= args.video_channel_id <= 255:
         parser.error("channel IDs must be between 0 and 255")
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("--timeout must be finite and positive")
+    if args.audio_channel_id == args.video_channel_id:
+        parser.error("audio and video channel IDs must differ")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
     return args
 
 
@@ -99,6 +102,27 @@ def save_temporary_media(source: Path, destination: Path, signature: bytes, offs
             raise RuntimeError(f"unexpected temporary media signature: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
+
+
+def retry_while_in_use(
+    name: str, operation: Callable[[], None], deadline: float
+) -> None:
+    while True:
+        try:
+            operation()
+            return
+        except tirtc.InUseError as error:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"{name} remained in use") from error
+            time.sleep(0.01)
+
+
+def close_when_idle(resource: object) -> None:
+    retry_while_in_use(
+        f"{type(resource).__name__}.close",
+        resource.close,
+        time.monotonic() + RESOURCE_CLOSE_TIMEOUT_SECONDS,
+    )
 
 
 def refresh_token(cloud: storage.CloudStorage) -> None:
@@ -119,9 +143,8 @@ def run() -> None:
             "TI_CLOUD_STORAGE_APP_ID and TI_CLOUD_STORAGE_ACCESS_TOKEN are required"
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    start = epoch + timedelta(milliseconds=args.start_ms)
-    end = epoch + timedelta(milliseconds=args.end_ms)
+    start = datetime.fromtimestamp(args.start_ms / 1000, timezone.utc)
+    end = datetime.fromtimestamp(args.end_ms / 1000, timezone.utc)
     deadline = time.monotonic() + args.timeout
     signals = Signals()
     frame_names = ("audio", "video", "encoded_audio", "encoded_video")
@@ -171,20 +194,20 @@ def run() -> None:
                 replay = cloud.create_replay(
                     on_completed=on_completed, on_error=on_replay_error
                 )
-                stack.callback(replay.close)
+                stack.callback(close_when_idle, replay)
                 audio = storage.AudioOutput(
                     lambda frame: signals.notify("audio"), on_error=on_output_error
                 )
-                stack.callback(audio.close)
+                stack.callback(close_when_idle, audio)
                 video = storage.VideoOutput(
                     lambda frame: signals.notify("video"), on_error=on_output_error
                 )
-                stack.callback(video.close)
+                stack.callback(close_when_idle, video)
                 encoded_audio = storage.EncodedAudioOutput(
                     lambda frame: signals.notify("encoded_audio"),
                     on_error=on_output_error,
                 )
-                stack.callback(encoded_audio.close)
+                stack.callback(close_when_idle, encoded_audio)
 
                 def on_encoded_video(frame: tirtc.EncodedVideoFrame) -> None:
                     signals.notify("encoded_video")
@@ -194,7 +217,7 @@ def run() -> None:
                 encoded_video = storage.EncodedVideoOutput(
                     on_encoded_video, on_error=on_output_error
                 )
-                stack.callback(encoded_video.close)
+                stack.callback(close_when_idle, encoded_video)
                 audio.attach(replay, args.audio_channel_id)
                 video.attach(replay, args.video_channel_id)
                 encoded_audio.attach(replay, args.audio_channel_id)
@@ -228,26 +251,31 @@ def run() -> None:
                         pass
                     raise
 
-                replay.pause()
-                replay.resume()
+                retry_while_in_use("Replay.pause", replay.pause, deadline)
+                retry_while_in_use("Replay.resume", replay.resume, deadline)
 
-                audio.detach()
+                retry_while_in_use("AudioOutput.detach", audio.detach, deadline)
                 span = selected.end_time - selected.start_time
-                span_ms = (
-                    span.days * 86_400_000
-                    + span.seconds * 1_000
-                    + span.microseconds // 1_000
-                )
-                replay.seek(
-                    selected.start_time + timedelta(milliseconds=span_ms // 5)
+                retry_while_in_use(
+                    "Replay.seek",
+                    lambda: replay.seek(selected.start_time + span / 5),
+                    deadline,
                 )
                 baseline = signals.snapshot(("video",))
-                replay.set_speed(storage.ReplaySpeed.X0_5)
+                retry_while_in_use(
+                    "Replay.set_speed(0.5x)",
+                    lambda: replay.set_speed(storage.ReplaySpeed.X0_5),
+                    deadline,
+                )
                 signals.wait_after(("video",), baseline, deadline)
                 if replay.speed is not storage.ReplaySpeed.X0_5:
                     raise RuntimeError("replay speed did not change to 0.5x")
                 baseline = signals.snapshot(("video",))
-                replay.set_speed(storage.ReplaySpeed.X1)
+                retry_while_in_use(
+                    "Replay.set_speed(1x)",
+                    lambda: replay.set_speed(storage.ReplaySpeed.X1),
+                    deadline,
+                )
                 signals.wait_after(("video",), baseline, deadline)
 
                 while True:
@@ -290,9 +318,13 @@ def run() -> None:
                         4,
                     )
 
-                encoded_video.detach()
-                encoded_audio.detach()
-                video.detach()
+                retry_while_in_use(
+                    "EncodedVideoOutput.detach", encoded_video.detach, deadline
+                )
+                retry_while_in_use(
+                    "EncodedAudioOutput.detach", encoded_audio.detach, deadline
+                )
+                retry_while_in_use("VideoOutput.detach", video.detach, deadline)
     finally:
         storage.shutdown()
 

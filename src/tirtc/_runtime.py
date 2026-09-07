@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import atexit
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -46,58 +45,9 @@ class _Configuration:
 
 _lock = threading.RLock()
 _configurations: dict[_Owner, _Configuration] = {}
-_process_id = os.getpid()
-_forked_with_runtime = False
-_interpreter_finalizing = False
-
-
-def _mark_finalizing() -> None:
-    global _interpreter_finalizing
-    _native.mark_finalizing()
-    _interpreter_finalizing = True
-
-
-atexit.register(_mark_finalizing)
-
-
-def _after_fork_child() -> None:
-    global _forked_with_runtime, _lock, _process_id
-    _forked_with_runtime = bool(_configurations)
-    _process_id = os.getpid()
-    _lock = threading.RLock()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_after_fork_child)
-
-
-def _process_is_current() -> bool:
-    return (
-        os.getpid() == _process_id
-        and not _forked_with_runtime
-        and not _interpreter_finalizing
-    )
-
-
-def _check_process() -> None:
-    if not _process_is_current():
-        if _interpreter_finalizing:
-            raise _new_error(
-                UnsupportedError,
-                code=None,
-                name="interpreter_finalizing",
-                message="TiRTC cannot be used while the Python interpreter is finalizing",
-            )
-        raise _new_error(
-            UnsupportedError,
-            code=None,
-            name="forked_process",
-            message="initialize TiRTC inside the worker process after fork",
-        )
 
 
 def _error_name(code: int) -> str:
-    _check_process()
     return str(_native.error_name(code))
 
 
@@ -141,7 +91,6 @@ def _initialize(
     endpoint: str | None,
     console_log_enabled: bool,
 ) -> None:
-    _check_process()
     configuration = _normalize_configuration(
         app_id, cache_dir, endpoint, console_log_enabled
     )
@@ -194,7 +143,6 @@ def _initialize(
 
 
 def _shutdown(owner: _Owner) -> None:
-    _check_process()
     with _lock:
         if owner not in _configurations:
             return

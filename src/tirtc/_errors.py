@@ -3,19 +3,38 @@ from __future__ import annotations
 from typing import NoReturn
 
 
+_ERROR_TOKEN = object()
+
+
 class TiRTCError(Exception):
     __slots__ = ("_code", "_name")
+
+    def __new__(
+        cls,
+        message: str = "",
+        *,
+        _token: object | None = None,
+        code: int | None = None,
+        name: str = "unknown",
+    ) -> TiRTCError:
+        if _token is not _ERROR_TOKEN:
+            raise TypeError("TiRTC errors are created by the SDK")
+        instance = super().__new__(cls)
+        instance._code = code
+        instance._name = name
+        return instance
 
     def __init__(
         self,
         message: str = "",
         *,
+        _token: object | None = None,
         code: int | None = None,
         name: str = "unknown",
     ) -> None:
+        if _token is not _ERROR_TOKEN:
+            raise TypeError("TiRTC errors are created by the SDK")
         super().__init__(message)
-        self._code = code
-        self._name = name
 
     @property
     def code(self) -> int | None:
@@ -146,14 +165,6 @@ class StoppedError(TiRTCError):
     __slots__ = ()
 
 
-class NetworkUnavailableError(TiRTCError):
-    __slots__ = ()
-
-
-class EndpointDNSResolutionFailedError(TiRTCError):
-    __slots__ = ()
-
-
 _ERROR_TYPES: dict[int, type[TiRTCError]] = {
     6000: InvalidArgumentError,
     6001: NotInitializedError,
@@ -201,8 +212,6 @@ _ERROR_TYPES: dict[int, type[TiRTCError]] = {
     6133: LogUploadError,
     6134: RecordingNotFoundError,
     6135: RecordingDownloadFailedError,
-    6136: NetworkUnavailableError,
-    6137: EndpointDNSResolutionFailedError,
 }
 
 
@@ -216,7 +225,7 @@ def _new_error(
     detail = message or name
     if code is not None:
         detail = f"{detail} ({code})"
-    return error_type(detail, code=code, name=name)
+    return error_type(detail, _token=_ERROR_TOKEN, code=code, name=name)
 
 
 def _error_from_code(code: int, name: str) -> TiRTCError:

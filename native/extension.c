@@ -1,16 +1,10 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <stdatomic.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 
 #include "ti/error.h"
 #include "ti/media.h"
@@ -19,27 +13,6 @@
 #include "ti/storage.h"
 
 #define TIRTC_CAPSULE_NAME "tirtc._native.Handle"
-
-static _Atomic int interpreter_finalizing = 0;
-
-static uint64_t current_process_id(void) {
-#ifdef _WIN32
-  return (uint64_t)_getpid();
-#else
-  return (uint64_t)getpid();
-#endif
-}
-
-static int callback_gil_ensure(PyGILState_STATE* gil) {
-  if (atomic_load(&interpreter_finalizing) || !Py_IsInitialized())
-    return 0;
-  *gil = PyGILState_Ensure();
-  if (atomic_load(&interpreter_finalizing)) {
-    PyGILState_Release(*gil);
-    return 0;
-  }
-  return 1;
-}
 
 typedef enum HandleKind {
   HANDLE_CONNECTION = 1,
@@ -60,7 +33,6 @@ typedef struct NativeHandle {
   HandleKind kind;
   void* pointer;
   PyObject* callback;
-  uint64_t creator_pid;
 } NativeHandle;
 
 typedef enum FrameKind {
@@ -71,25 +43,23 @@ typedef enum FrameKind {
 } FrameKind;
 
 typedef struct FrameBuffer {
-  PyObject_HEAD FrameKind kind;
+  PyObject_HEAD
+  FrameKind kind;
   void* frame;
   const uint8_t* data;
   Py_ssize_t size;
-  uint64_t creator_pid;
 } FrameBuffer;
 
 static PyObject* frame_buffer_type = NULL;
 
 static const char* unicode_utf8(PyObject* value, PyObject** owner) {
   *owner = PyUnicode_AsEncodedString(value, "utf-8", "strict");
-  if (*owner == NULL)
-    return NULL;
+  if (*owner == NULL) return NULL;
   return PyBytes_AsString(*owner);
 }
 
 static void frame_release(FrameKind kind, void* frame) {
-  if (frame == NULL)
-    return;
+  if (frame == NULL) return;
   switch (kind) {
     case FRAME_AUDIO:
       ti_audio_frame_release((TiAudioFrame*)frame);
@@ -122,8 +92,7 @@ static void* frame_retain(FrameKind kind, const void* frame) {
 
 static void frame_buffer_dealloc(PyObject* object) {
   FrameBuffer* buffer = (FrameBuffer*)object;
-  if (!atomic_load(&interpreter_finalizing) && buffer->creator_pid == current_process_id())
-    frame_release(buffer->kind, buffer->frame);
+  frame_release(buffer->kind, buffer->frame);
   PyTypeObject* type = Py_TYPE(object);
   freefunc free_object = (freefunc)PyType_GetSlot(type, Py_tp_free);
   free_object(object);
@@ -159,14 +128,12 @@ static PyObject* frame_memoryview(FrameKind kind, const void* frame, const uint8
     return NULL;
   }
   PyObject* owner = PyObject_CallNoArgs(frame_buffer_type);
-  if (owner == NULL)
-    return NULL;
+  if (owner == NULL) return NULL;
   FrameBuffer* buffer = (FrameBuffer*)owner;
   buffer->kind = kind;
   buffer->frame = frame_retain(kind, frame);
   buffer->data = data;
   buffer->size = (Py_ssize_t)size;
-  buffer->creator_pid = current_process_id();
   if (buffer->frame == NULL) {
     Py_DECREF(owner);
     PyErr_SetString(PyExc_RuntimeError, "failed to retain native frame");
@@ -178,8 +145,7 @@ static PyObject* frame_memoryview(FrameKind kind, const void* frame, const uint8
 }
 
 static TiError close_pointer(NativeHandle* handle) {
-  if (handle == NULL || handle->pointer == NULL)
-    return TI_ERROR_OK;
+  if (handle == NULL || handle->pointer == NULL) return TI_ERROR_OK;
   switch (handle->kind) {
     case HANDLE_CONNECTION:
       return tirtc_conn_destroy((TiRtcConn*)handle->pointer);
@@ -204,7 +170,8 @@ static TiError close_pointer(NativeHandle* handle) {
     case HANDLE_REPLAY:
       return ti_cloud_storage_replay_destroy((TiCloudStorageReplay*)handle->pointer);
     case HANDLE_STORAGE_RECORDING:
-      return ti_cloud_storage_recording_task_destroy((TiCloudStorageRecordingTask*)handle->pointer);
+      return ti_cloud_storage_recording_task_destroy(
+          (TiCloudStorageRecordingTask*)handle->pointer);
     case HANDLE_EXPORT:
       return ti_cloud_storage_export_task_destroy((TiCloudStorageExportTask*)handle->pointer);
   }
@@ -219,16 +186,11 @@ static void mark_closed(NativeHandle* handle) {
 static void abandon_handle(NativeHandle* handle) {
   TiError error = TI_ERROR_OK;
   if (handle->pointer != NULL) {
-    Py_BEGIN_ALLOW_THREADS error = close_pointer(handle);
+    Py_BEGIN_ALLOW_THREADS
+    error = close_pointer(handle);
     Py_END_ALLOW_THREADS
   }
-  if (error != TI_ERROR_OK)
-    return;
-  Py_XDECREF(handle->callback);
-  free(handle);
-}
-
-static void discard_inherited_handle(NativeHandle* handle) {
+  if (error != TI_ERROR_OK) return;
   Py_XDECREF(handle->callback);
   free(handle);
 }
@@ -267,12 +229,6 @@ static void capsule_destructor(PyObject* capsule) {
     PyErr_Clear();
     return;
   }
-  if (atomic_load(&interpreter_finalizing))
-    return;
-  if (handle->creator_pid != current_process_id()) {
-    discard_inherited_handle(handle);
-    return;
-  }
   if (handle->pointer != NULL) {
     char message[96];
     (void)snprintf(message, sizeof(message), "unclosed TiRTC %s", handle_kind_name(handle->kind));
@@ -290,7 +246,6 @@ static NativeHandle* handle_new(HandleKind kind, PyObject* callback) {
     return NULL;
   }
   handle->kind = kind;
-  handle->creator_pid = current_process_id();
   if (callback != NULL) {
     if (!PyCallable_Check(callback)) {
       free(handle);
@@ -305,33 +260,13 @@ static NativeHandle* handle_new(HandleKind kind, PyObject* callback) {
 
 static PyObject* handle_capsule(NativeHandle* handle) {
   PyObject* capsule = PyCapsule_New(handle, TIRTC_CAPSULE_NAME, capsule_destructor);
-  if (capsule == NULL)
-    abandon_handle(handle);
+  if (capsule == NULL) abandon_handle(handle);
   return capsule;
-}
-
-static PyObject* handle_result(NativeHandle* handle) {
-  PyObject* capsule = handle_capsule(handle);
-  if (capsule == NULL)
-    return NULL;
-  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
-  Py_DECREF(capsule);
-  return result;
-}
-
-static void discard_handle_result(PyObject* result, NativeHandle* handle) {
-  TiError error = TI_ERROR_OK;
-  if (handle->pointer != NULL) {
-    Py_BEGIN_ALLOW_THREADS error = close_pointer(handle);
-    Py_END_ALLOW_THREADS if (error == TI_ERROR_OK) mark_closed(handle);
-  }
-  Py_DECREF(result);
 }
 
 static NativeHandle* get_handle(PyObject* capsule, HandleKind kind) {
   NativeHandle* handle = (NativeHandle*)PyCapsule_GetPointer(capsule, TIRTC_CAPSULE_NAME);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   if (handle->kind != kind || handle->pointer == NULL) {
     PyErr_SetString(PyExc_RuntimeError, "native handle has the wrong type or is closed");
     return NULL;
@@ -346,8 +281,7 @@ static int is_output(HandleKind kind) {
 
 static NativeHandle* get_output(PyObject* capsule) {
   NativeHandle* handle = (NativeHandle*)PyCapsule_GetPointer(capsule, TIRTC_CAPSULE_NAME);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   if (!is_output(handle->kind) || handle->pointer == NULL) {
     PyErr_SetString(PyExc_RuntimeError, "native output handle is closed");
     return NULL;
@@ -378,9 +312,8 @@ static void report_callback_error(NativeHandle* handle) {
 }
 
 static void emit_simple(NativeHandle* handle, const char* event) {
-  PyGILState_STATE state;
-  if (!callback_gil_ensure(&state))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE state = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(s)", event));
   PyGILState_Release(state);
 }
@@ -389,9 +322,8 @@ static void conn_on_state(TiRtcConn* connection, TiRtcConnState state, TiError e
                           void* user_data) {
   (void)connection;
   NativeHandle* handle = (NativeHandle*)user_data;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(sIi)", "state", state, error));
   PyGILState_Release(gil);
 }
@@ -400,11 +332,8 @@ static void conn_on_command(TiRtcConn* connection, uint32_t command, const uint8
                             uint64_t data_size, void* user_data) {
   (void)connection;
   NativeHandle* handle = (NativeHandle*)user_data;
-  if (data_size > (uint64_t)PY_SSIZE_T_MAX)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized() || data_size > (uint64_t)PY_SSIZE_T_MAX) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* payload = PyBytes_FromStringAndSize((const char*)data, (Py_ssize_t)data_size);
   if (payload != NULL) {
     PyObject* arguments = Py_BuildValue("(skO)", "command", (unsigned long)command, payload);
@@ -420,15 +349,12 @@ static void conn_on_message(TiRtcConn* connection, uint8_t stream_id, uint32_t t
                             const uint8_t* data, uint64_t data_size, void* user_data) {
   (void)connection;
   NativeHandle* handle = (NativeHandle*)user_data;
-  if (data_size > (uint64_t)PY_SSIZE_T_MAX)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized() || data_size > (uint64_t)PY_SSIZE_T_MAX) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* payload = PyBytes_FromStringAndSize((const char*)data, (Py_ssize_t)data_size);
   if (payload != NULL) {
-    PyObject* arguments =
-        Py_BuildValue("(sIIO)", "message", (unsigned int)stream_id, timestamp_ms, payload);
+    PyObject* arguments = Py_BuildValue("(sIIO)", "message", (unsigned int)stream_id,
+                                        timestamp_ms, payload);
     Py_DECREF(payload);
     call_callback_locked(handle, arguments);
   } else {
@@ -437,20 +363,19 @@ static void conn_on_message(TiRtcConn* connection, uint8_t stream_id, uint32_t t
   PyGILState_Release(gil);
 }
 
-static TiRtcConnCallbacks connection_callbacks(int command_enabled, int message_enabled) {
+static TiRtcConnCallbacks connection_callbacks(void) {
   TiRtcConnCallbacks callbacks = TI_RTC_CONN_CALLBACKS_INITIALIZER;
   callbacks.on_state_changed = conn_on_state;
-  callbacks.on_command = command_enabled ? conn_on_command : NULL;
-  callbacks.on_stream_message = message_enabled ? conn_on_message : NULL;
+  callbacks.on_command = conn_on_command;
+  callbacks.on_stream_message = conn_on_message;
   return callbacks;
 }
 
 static void output_on_state_audio(TiAudioOutput* output, TiOutputState state, void* user_data) {
   (void)output;
   NativeHandle* handle = (NativeHandle*)user_data;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(sI)", "state", state));
   PyGILState_Release(gil);
 }
@@ -470,9 +395,8 @@ static void output_on_state_encoded_video(TiEncodedVideoOutput* output, TiOutput
 }
 
 static void output_error(NativeHandle* handle, TiError error) {
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(si)", "error", error));
   PyGILState_Release(gil);
 }
@@ -509,17 +433,15 @@ static void output_on_audio_frame(TiAudioOutput* output, const TiAudioFrame* fra
                                   void* user_data) {
   (void)output;
   TiAudioFrameInfo info = TI_AUDIO_FRAME_INFO_INITIALIZER;
-  if (atomic_load(&interpreter_finalizing) || ti_audio_frame_get_info(frame, &info) != TI_ERROR_OK)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (ti_audio_frame_get_info(frame, &info) != TI_ERROR_OK || !Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* data = frame_memoryview(FRAME_AUDIO, frame, info.data, info.data_size);
   if (data != NULL) {
     PyObject* arguments = Py_BuildValue(
         "(sOLLiIIIIO)", "audio_frame", data, info.pts_us, info.source_time_utc_us,
         (int)info.has_source_time, info.format.sample_format, info.format.sample_rate_hz,
-        info.format.channels, info.samples_per_channel, info.discontinuity ? Py_True : Py_False);
+        info.format.channels, info.samples_per_channel,
+        info.discontinuity ? Py_True : Py_False);
     Py_DECREF(data);
     call_callback_locked((NativeHandle*)user_data, arguments);
   } else {
@@ -532,18 +454,16 @@ static void output_on_video_frame(TiVideoOutput* output, const TiVideoFrame* fra
                                   void* user_data) {
   (void)output;
   TiVideoFrameInfo info = TI_VIDEO_FRAME_INFO_INITIALIZER;
-  if (atomic_load(&interpreter_finalizing) || ti_video_frame_get_info(frame, &info) != TI_ERROR_OK)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (ti_video_frame_get_info(frame, &info) != TI_ERROR_OK || !Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* planes = PyTuple_New((Py_ssize_t)info.plane_count);
   if (planes != NULL) {
     for (uint32_t index = 0; index < info.plane_count; ++index) {
       PyObject* data = frame_memoryview(FRAME_VIDEO, frame, info.planes[index].data,
                                         info.planes[index].data_size);
-      PyObject* plane =
-          data == NULL ? NULL : Py_BuildValue("(IO)", info.planes[index].stride_bytes, data);
+      PyObject* plane = data == NULL
+                            ? NULL
+                            : Py_BuildValue("(IO)", info.planes[index].stride_bytes, data);
       Py_XDECREF(data);
       if (plane == NULL) {
         Py_DECREF(planes);
@@ -554,10 +474,10 @@ static void output_on_video_frame(TiVideoOutput* output, const TiVideoFrame* fra
     }
   }
   if (planes != NULL) {
-    PyObject* arguments =
-        Py_BuildValue("(sOLLiIIIO)", "video_frame", planes, info.pts_us, info.source_time_utc_us,
-                      (int)info.has_source_time, info.pixel_format, info.width, info.height,
-                      info.discontinuity ? Py_True : Py_False);
+    PyObject* arguments = Py_BuildValue(
+        "(sOLLiIIIO)", "video_frame", planes, info.pts_us, info.source_time_utc_us,
+        (int)info.has_source_time, info.pixel_format, info.width, info.height,
+        info.discontinuity ? Py_True : Py_False);
     Py_DECREF(planes);
     call_callback_locked((NativeHandle*)user_data, arguments);
   } else {
@@ -567,24 +487,21 @@ static void output_on_video_frame(TiVideoOutput* output, const TiVideoFrame* fra
 }
 
 static void output_on_encoded_audio_frame(TiEncodedAudioOutput* output,
-                                          const TiEncodedAudioFrame* frame, void* user_data) {
+                                          const TiEncodedAudioFrame* frame,
+                                          void* user_data) {
   (void)output;
   TiEncodedAudioFrameInfo info = TI_ENCODED_AUDIO_FRAME_INFO_INITIALIZER;
-  if (atomic_load(&interpreter_finalizing) ||
-      ti_encoded_audio_frame_get_info(frame, &info) != TI_ERROR_OK)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (ti_encoded_audio_frame_get_info(frame, &info) != TI_ERROR_OK || !Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* data = frame_memoryview(FRAME_ENCODED_AUDIO, frame, info.data, info.data_size);
-  PyObject* config = data == NULL ? NULL
-                                  : frame_memoryview(FRAME_ENCODED_AUDIO, frame, info.codec_config,
-                                                     info.codec_config_size);
+  PyObject* config = data == NULL ? NULL : frame_memoryview(
+      FRAME_ENCODED_AUDIO, frame, info.codec_config, info.codec_config_size);
   if (data != NULL && config != NULL) {
     PyObject* arguments = Py_BuildValue(
-        "(sOOLLiIIIIO)", "encoded_audio_frame", data, config, info.pts_us, info.source_time_utc_us,
-        (int)info.has_source_time, info.codec, info.bitstream_format, info.sample_rate_hz,
-        info.channels, info.discontinuity ? Py_True : Py_False);
+        "(sOOLLiIIIIO)", "encoded_audio_frame", data, config, info.pts_us,
+        info.source_time_utc_us, (int)info.has_source_time, info.codec,
+        info.bitstream_format, info.sample_rate_hz, info.channels,
+        info.discontinuity ? Py_True : Py_False);
     call_callback_locked((NativeHandle*)user_data, arguments);
   } else {
     report_callback_error((NativeHandle*)user_data);
@@ -595,24 +512,22 @@ static void output_on_encoded_audio_frame(TiEncodedAudioOutput* output,
 }
 
 static void output_on_encoded_video_frame(TiEncodedVideoOutput* output,
-                                          const TiEncodedVideoFrame* frame, void* user_data) {
+                                          const TiEncodedVideoFrame* frame,
+                                          void* user_data) {
   (void)output;
   TiEncodedVideoFrameInfo info = TI_ENCODED_VIDEO_FRAME_INFO_INITIALIZER;
-  if (atomic_load(&interpreter_finalizing) ||
-      ti_encoded_video_frame_get_info(frame, &info) != TI_ERROR_OK)
-    return;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (ti_encoded_video_frame_get_info(frame, &info) != TI_ERROR_OK || !Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   PyObject* data = frame_memoryview(FRAME_ENCODED_VIDEO, frame, info.data, info.data_size);
-  PyObject* config = data == NULL ? NULL
-                                  : frame_memoryview(FRAME_ENCODED_VIDEO, frame, info.codec_config,
-                                                     info.codec_config_size);
+  PyObject* config = data == NULL ? NULL : frame_memoryview(
+      FRAME_ENCODED_VIDEO, frame, info.codec_config, info.codec_config_size);
   if (data != NULL && config != NULL) {
     PyObject* arguments = Py_BuildValue(
-        "(sOOLLiIIIIOO)", "encoded_video_frame", data, config, info.pts_us, info.source_time_utc_us,
-        (int)info.has_source_time, info.codec, info.bitstream_format, info.width, info.height,
-        info.key_frame ? Py_True : Py_False, info.discontinuity ? Py_True : Py_False);
+        "(sOOLLiIIIIOO)", "encoded_video_frame", data, config, info.pts_us,
+        info.source_time_utc_us, (int)info.has_source_time, info.codec,
+        info.bitstream_format, info.width, info.height,
+        info.key_frame ? Py_True : Py_False,
+        info.discontinuity ? Py_True : Py_False);
     call_callback_locked((NativeHandle*)user_data, arguments);
   } else {
     report_callback_error((NativeHandle*)user_data);
@@ -622,12 +537,14 @@ static void output_on_encoded_video_frame(TiEncodedVideoOutput* output,
   PyGILState_Release(gil);
 }
 
-static void request_completed_recordings(TiCloudStorageRecordingRequest* request, void* user_data) {
+static void request_completed_recordings(TiCloudStorageRecordingRequest* request,
+                                         void* user_data) {
   (void)request;
   emit_simple((NativeHandle*)user_data, "completed");
 }
 
-static void request_completed_days(TiCloudStorageRecordingDaysRequest* request, void* user_data) {
+static void request_completed_days(TiCloudStorageRecordingDaysRequest* request,
+                                   void* user_data) {
   (void)request;
   emit_simple((NativeHandle*)user_data, "completed");
 }
@@ -635,9 +552,8 @@ static void request_completed_days(TiCloudStorageRecordingDaysRequest* request, 
 static void replay_on_time(TiCloudStorageReplay* replay, int64_t time_ms, void* user_data) {
   (void)replay;
   NativeHandle* handle = (NativeHandle*)user_data;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(sL)", "time", time_ms));
   PyGILState_Release(gil);
 }
@@ -650,10 +566,19 @@ static void replay_on_completed(TiCloudStorageReplay* replay, void* user_data) {
 static void replay_on_error(TiCloudStorageReplay* replay, TiError error, void* user_data) {
   (void)replay;
   NativeHandle* handle = (NativeHandle*)user_data;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   call_callback_locked(handle, Py_BuildValue("(si)", "error", error));
+  PyGILState_Release(gil);
+}
+
+static void export_on_progress(TiCloudStorageExportTask* task, double progress,
+                               void* user_data) {
+  (void)task;
+  NativeHandle* handle = (NativeHandle*)user_data;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
+  call_callback_locked(handle, Py_BuildValue("(sd)", "progress", progress));
   PyGILState_Release(gil);
 }
 
@@ -661,28 +586,20 @@ static void export_on_completed(TiCloudStorageExportTask* task, TiError error,
                                 const TiCloudStorageMp4File* file, void* user_data) {
   (void)task;
   NativeHandle* handle = (NativeHandle*)user_data;
-  PyGILState_STATE gil;
-  if (!callback_gil_ensure(&gil))
-    return;
+  if (!Py_IsInitialized()) return;
+  PyGILState_STATE gil = PyGILState_Ensure();
   const char* path = file == NULL || file->file_path == NULL ? "" : file->file_path;
   int64_t duration = file == NULL ? 0 : file->duration_ms;
-  call_callback_locked(handle, Py_BuildValue("(sisL)", "completed", error, path, duration));
+  call_callback_locked(handle,
+                       Py_BuildValue("(sisL)", "completed", error, path, duration));
   PyGILState_Release(gil);
 }
 
 static PyObject* py_error_name(PyObject* module, PyObject* argument) {
   (void)module;
   long code = PyLong_AsLong(argument);
-  if (code == -1 && PyErr_Occurred())
-    return NULL;
+  if (code == -1 && PyErr_Occurred()) return NULL;
   return PyUnicode_FromString(ti_error_to_string((TiError)code));
-}
-
-static PyObject* py_mark_finalizing(PyObject* module, PyObject* unused) {
-  (void)module;
-  (void)unused;
-  atomic_store(&interpreter_finalizing, 1);
-  Py_RETURN_NONE;
 }
 
 static PyObject* py_rtc_initialize(PyObject* module, PyObject* arguments) {
@@ -691,24 +608,21 @@ static PyObject* py_rtc_initialize(PyObject* module, PyObject* arguments) {
   const char* endpoint;
   const char* cache_dir;
   int console_log_enabled;
-  if (!PyArg_ParseTuple(arguments, "szsp", &app_id, &endpoint, &cache_dir, &console_log_enabled))
+  if (!PyArg_ParseTuple(arguments, "szsp", &app_id, &endpoint, &cache_dir,
+                        &console_log_enabled))
     return NULL;
   TiRtcInitOptions options = TI_RTC_INIT_OPTIONS_INITIALIZER;
   options.app_id = app_id;
   options.endpoint = endpoint;
   options.cache_root_dir = cache_dir;
   options.console_log_enabled = (uint8_t)console_log_enabled;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = tirtc_init(&options);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  return PyLong_FromLong(tirtc_init(&options));
 }
 
 static PyObject* py_rtc_shutdown(PyObject* module, PyObject* unused) {
   (void)module;
   (void)unused;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = tirtc_uninit();
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  return PyLong_FromLong(tirtc_uninit());
 }
 
 static PyObject* py_storage_initialize(PyObject* module, PyObject* arguments) {
@@ -717,83 +631,60 @@ static PyObject* py_storage_initialize(PyObject* module, PyObject* arguments) {
   const char* endpoint;
   const char* cache_dir;
   int console_log_enabled;
-  if (!PyArg_ParseTuple(arguments, "szsp", &app_id, &endpoint, &cache_dir, &console_log_enabled))
+  if (!PyArg_ParseTuple(arguments, "szsp", &app_id, &endpoint, &cache_dir,
+                        &console_log_enabled))
     return NULL;
   TiCloudStorageInitOptions options = TI_CLOUD_STORAGE_INIT_OPTIONS_INITIALIZER;
   options.app_id = app_id;
   options.endpoint = endpoint;
   options.cache_root_dir = cache_dir;
   options.console_log_enabled = (uint8_t)console_log_enabled;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_init(&options);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  return PyLong_FromLong(ti_cloud_storage_init(&options));
 }
 
 static PyObject* py_storage_shutdown(PyObject* module, PyObject* unused) {
   (void)module;
   (void)unused;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_uninit();
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  return PyLong_FromLong(ti_cloud_storage_uninit());
 }
 
 static PyObject* py_upload_logs(PyObject* module, PyObject* unused) {
   (void)module;
   (void)unused;
   char log_id[TI_LOG_ID_CAPACITY] = {0};
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_logging_upload(log_id, sizeof(log_id));
-  Py_END_ALLOW_THREADS return Py_BuildValue("(is)", error, error == TI_ERROR_OK ? log_id : "");
-}
-
-static PyObject* py_write_log(PyObject* module, PyObject* arguments) {
-  (void)module;
-  unsigned int level;
-  const char* tag;
-  const char* message;
-  if (!PyArg_ParseTuple(arguments, "Iss", &level, &tag, &message))
-    return NULL;
-  return PyLong_FromLong(ti_logging_write((TiLogLevel)level, tag, message));
+  TiError error = ti_logging_upload(log_id, sizeof(log_id));
+  return Py_BuildValue("(is)", error, error == TI_ERROR_OK ? log_id : "");
 }
 
 static PyObject* py_delete_media_file(PyObject* module, PyObject* argument) {
   (void)module;
   PyObject* encoded = NULL;
   const char* path = unicode_utf8(argument, &encoded);
-  if (path == NULL)
-    return NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_local_media_file_delete(path);
-  Py_END_ALLOW_THREADS PyObject* result = PyLong_FromLong(error);
+  if (path == NULL) return NULL;
+  PyObject* result = PyLong_FromLong(ti_local_media_file_delete(path));
   Py_DECREF(encoded);
   return result;
 }
 
-static PyObject* py_conn_create(PyObject* module, PyObject* arguments) {
+static PyObject* py_conn_create(PyObject* module, PyObject* callback) {
   (void)module;
-  PyObject* callback;
-  int command_enabled;
-  int message_enabled;
-  if (!PyArg_ParseTuple(arguments, "Opp", &callback, &command_enabled, &message_enabled))
-    return NULL;
   NativeHandle* handle = handle_new(HANDLE_CONNECTION, callback);
-  if (handle == NULL)
-    return NULL;
-  PyObject* result = handle_result(handle);
-  if (result == NULL)
-    return NULL;
-  TiRtcConnCallbacks callbacks = connection_callbacks(command_enabled, message_enabled);
+  if (handle == NULL) return NULL;
+  TiRtcConnCallbacks callbacks = connection_callbacks();
   TiRtcConnCreateOptions options = TI_RTC_CONN_CREATE_OPTIONS_INITIALIZER;
   options.callbacks = &callbacks;
   options.user_data = handle;
   TiRtcConn* connection = NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = tirtc_conn_create(&options, &connection);
-  Py_END_ALLOW_THREADS handle->pointer = connection;
+  TiError error = tirtc_conn_create(&options, &connection);
+  handle->pointer = connection;
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+    abandon_handle(handle);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  PyObject* capsule = handle_capsule(handle);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
@@ -802,29 +693,30 @@ static PyObject* py_conn_connect(PyObject* module, PyObject* arguments) {
   PyObject* capsule;
   const char* remote_id;
   const char* token;
-  if (!PyArg_ParseTuple(arguments, "Oss", &capsule, &remote_id, &token))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "Oss", &capsule, &remote_id, &token)) return NULL;
   NativeHandle* handle = get_handle(capsule, HANDLE_CONNECTION);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   TiRtcConnConnectOptions options = TI_RTC_CONN_CONNECT_OPTIONS_INITIALIZER;
   options.remote_id = remote_id;
   options.token = token;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = tirtc_conn_connect((TiRtcConn*)handle->pointer, &options);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = tirtc_conn_connect((TiRtcConn*)handle->pointer, &options);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
-static PyObject* py_conn_simple(PyObject* arguments, TiError (*operation)(TiRtcConn*)) {
+static PyObject* py_conn_simple(PyObject* arguments,
+                                TiError (*operation)(TiRtcConn*)) {
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* handle = get_handle(capsule, HANDLE_CONNECTION);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = operation((TiRtcConn*)handle->pointer);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = operation((TiRtcConn*)handle->pointer);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_conn_disconnect(PyObject* module, PyObject* arguments) {
@@ -837,18 +729,18 @@ static PyObject* py_conn_send_command(PyObject* module, PyObject* arguments) {
   PyObject* capsule;
   unsigned long command_id;
   PyObject* payload;
-  if (!PyArg_ParseTuple(arguments, "OkO", &capsule, &command_id, &payload))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OkO", &capsule, &command_id, &payload)) return NULL;
   NativeHandle* handle = get_handle(capsule, HANDLE_CONNECTION);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   Py_buffer view;
-  if (PyObject_GetBuffer(payload, &view, PyBUF_CONTIG_RO) != 0)
-    return NULL;
-  TiRtcConnCommand command = {(uint32_t)command_id, (const uint8_t*)view.buf, (uint64_t)view.len};
+  if (PyObject_GetBuffer(payload, &view, PyBUF_CONTIG_RO) != 0) return NULL;
+  TiRtcConnCommand command = {(uint32_t)command_id, (const uint8_t*)view.buf,
+                              (uint64_t)view.len};
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = tirtc_conn_send_command((TiRtcConn*)handle->pointer, &command);
-  Py_END_ALLOW_THREADS PyBuffer_Release(&view);
+  Py_BEGIN_ALLOW_THREADS
+  error = tirtc_conn_send_command((TiRtcConn*)handle->pointer, &command);
+  Py_END_ALLOW_THREADS
+  PyBuffer_Release(&view);
   return PyLong_FromLong(error);
 }
 
@@ -861,17 +753,17 @@ static PyObject* py_conn_send_message(PyObject* module, PyObject* arguments) {
   if (!PyArg_ParseTuple(arguments, "OIkO", &capsule, &stream_id, &timestamp_ms, &payload))
     return NULL;
   NativeHandle* handle = get_handle(capsule, HANDLE_CONNECTION);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   Py_buffer view;
-  if (PyObject_GetBuffer(payload, &view, PyBUF_CONTIG_RO) != 0)
-    return NULL;
+  if (PyObject_GetBuffer(payload, &view, PyBUF_CONTIG_RO) != 0) return NULL;
   TiRtcStreamMessage message = {(uint32_t)timestamp_ms, (const uint8_t*)view.buf,
                                 (uint64_t)view.len};
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      tirtc_conn_send_stream_message((TiRtcConn*)handle->pointer, (uint8_t)stream_id, &message);
-  Py_END_ALLOW_THREADS PyBuffer_Release(&view);
+  Py_BEGIN_ALLOW_THREADS
+  error = tirtc_conn_send_stream_message((TiRtcConn*)handle->pointer,
+                                         (uint8_t)stream_id, &message);
+  Py_END_ALLOW_THREADS
+  PyBuffer_Release(&view);
   return PyLong_FromLong(error);
 }
 
@@ -879,20 +771,20 @@ static PyObject* py_conn_stream_operation(PyObject* arguments,
                                           TiError (*operation)(TiRtcConn*, uint8_t)) {
   PyObject* capsule;
   unsigned int stream_id;
-  if (!PyArg_ParseTuple(arguments, "OI", &capsule, &stream_id))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OI", &capsule, &stream_id)) return NULL;
   NativeHandle* handle = get_handle(capsule, HANDLE_CONNECTION);
-  if (handle == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = operation((TiRtcConn*)handle->pointer, (uint8_t)stream_id);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = operation((TiRtcConn*)handle->pointer, (uint8_t)stream_id);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
-#define CONN_STREAM_METHOD(name, native_name)                    \
-  static PyObject* name(PyObject* module, PyObject* arguments) { \
-    (void)module;                                                \
-    return py_conn_stream_operation(arguments, native_name);     \
+#define CONN_STREAM_METHOD(name, native_name)                                      \
+  static PyObject* name(PyObject* module, PyObject* arguments) {                   \
+    (void)module;                                                                  \
+    return py_conn_stream_operation(arguments, native_name);                       \
   }
 
 CONN_STREAM_METHOD(py_conn_subscribe_audio, tirtc_conn_subscribe_audio)
@@ -915,15 +807,13 @@ static PyObject* py_output_create(PyObject* module, PyObject* arguments) {
   (void)module;
   const char* kind;
   PyObject* callback;
-  int state_enabled;
-  int error_enabled;
   unsigned int agc;
   unsigned int ans;
   unsigned int decoder;
   unsigned int strategy;
   long watermark_ms;
-  if (!PyArg_ParseTuple(arguments, "sOppIIIIl", &kind, &callback, &state_enabled, &error_enabled,
-                        &agc, &ans, &decoder, &strategy, &watermark_ms))
+  if (!PyArg_ParseTuple(arguments, "sOIIIIl", &kind, &callback, &agc, &ans, &decoder,
+                        &strategy, &watermark_ms))
     return NULL;
   HandleKind handle_kind;
   if (strcmp(kind, "audio") == 0)
@@ -939,14 +829,10 @@ static PyObject* py_output_create(PyObject* module, PyObject* arguments) {
     return NULL;
   }
   NativeHandle* handle = handle_new(handle_kind, callback);
-  if (handle == NULL)
-    return NULL;
-  PyObject* result = handle_result(handle);
-  if (result == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   TiError error = TI_ERROR_OK;
   TiOutputBufferOptions buffer = make_buffer_options(strategy, watermark_ms);
-  Py_BEGIN_ALLOW_THREADS if (handle_kind == HANDLE_AUDIO_OUTPUT) {
+  if (handle_kind == HANDLE_AUDIO_OUTPUT) {
     TiAudioOutput* output = NULL;
     error = ti_audio_output_create(&output);
     if (error == TI_ERROR_OK) {
@@ -955,18 +841,16 @@ static PyObject* py_output_create(PyObject* module, PyObject* arguments) {
       options.ans_level = (TiAudioAnsLevel)ans;
       error = ti_audio_output_set_options(output, &options);
     }
-    if (error == TI_ERROR_OK)
-      error = ti_audio_output_set_buffer_options(output, &buffer);
+    if (error == TI_ERROR_OK) error = ti_audio_output_set_buffer_options(output, &buffer);
     if (error == TI_ERROR_OK) {
       TiAudioOutputCallbacks callbacks = TI_AUDIO_OUTPUT_CALLBACKS_INITIALIZER;
       callbacks.on_frame = output_on_audio_frame;
-      callbacks.on_state_changed = state_enabled ? output_on_state_audio : NULL;
-      callbacks.on_error = error_enabled ? output_on_error_audio : NULL;
+      callbacks.on_state_changed = output_on_state_audio;
+      callbacks.on_error = output_on_error_audio;
       error = ti_audio_output_set_callbacks(output, &callbacks, handle);
     }
     handle->pointer = output;
-  }
-  else if (handle_kind == HANDLE_VIDEO_OUTPUT) {
+  } else if (handle_kind == HANDLE_VIDEO_OUTPUT) {
     TiVideoOutput* output = NULL;
     error = ti_video_output_create(&output);
     if (error == TI_ERROR_OK) {
@@ -974,45 +858,46 @@ static PyObject* py_output_create(PyObject* module, PyObject* arguments) {
       options.decoder_preference = (TiVideoDecoderPreference)decoder;
       error = ti_video_output_set_options(output, &options);
     }
-    if (error == TI_ERROR_OK)
-      error = ti_video_output_set_buffer_options(output, &buffer);
+    if (error == TI_ERROR_OK) error = ti_video_output_set_buffer_options(output, &buffer);
     if (error == TI_ERROR_OK) {
       TiVideoOutputCallbacks callbacks = TI_VIDEO_OUTPUT_CALLBACKS_INITIALIZER;
       callbacks.on_frame = output_on_video_frame;
-      callbacks.on_state_changed = state_enabled ? output_on_state_video : NULL;
-      callbacks.on_error = error_enabled ? output_on_error_video : NULL;
+      callbacks.on_state_changed = output_on_state_video;
+      callbacks.on_error = output_on_error_video;
       error = ti_video_output_set_callbacks(output, &callbacks, handle);
     }
     handle->pointer = output;
-  }
-  else if (handle_kind == HANDLE_ENCODED_AUDIO_OUTPUT) {
+  } else if (handle_kind == HANDLE_ENCODED_AUDIO_OUTPUT) {
     TiEncodedAudioOutput* output = NULL;
     error = ti_encoded_audio_output_create(&output);
     if (error == TI_ERROR_OK) {
       TiEncodedAudioOutputCallbacks callbacks = TI_ENCODED_AUDIO_OUTPUT_CALLBACKS_INITIALIZER;
       callbacks.on_frame = output_on_encoded_audio_frame;
-      callbacks.on_state_changed = state_enabled ? output_on_state_encoded_audio : NULL;
-      callbacks.on_error = error_enabled ? output_on_error_encoded_audio : NULL;
+      callbacks.on_state_changed = output_on_state_encoded_audio;
+      callbacks.on_error = output_on_error_encoded_audio;
       error = ti_encoded_audio_output_set_callbacks(output, &callbacks, handle);
     }
     handle->pointer = output;
-  }
-  else {
+  } else {
     TiEncodedVideoOutput* output = NULL;
     error = ti_encoded_video_output_create(&output);
     if (error == TI_ERROR_OK) {
       TiEncodedVideoOutputCallbacks callbacks = TI_ENCODED_VIDEO_OUTPUT_CALLBACKS_INITIALIZER;
       callbacks.on_frame = output_on_encoded_video_frame;
-      callbacks.on_state_changed = state_enabled ? output_on_state_encoded_video : NULL;
-      callbacks.on_error = error_enabled ? output_on_error_encoded_video : NULL;
+      callbacks.on_state_changed = output_on_state_encoded_video;
+      callbacks.on_error = output_on_error_encoded_video;
       error = ti_encoded_video_output_set_callbacks(output, &callbacks, handle);
     }
     handle->pointer = output;
   }
-  Py_END_ALLOW_THREADS if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+  if (error != TI_ERROR_OK) {
+    abandon_handle(handle);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  PyObject* capsule = handle_capsule(handle);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
@@ -1021,14 +906,15 @@ static PyObject* py_output_attach_rtc(PyObject* module, PyObject* arguments) {
   PyObject* output_capsule;
   PyObject* connection_capsule;
   unsigned int stream_id;
-  if (!PyArg_ParseTuple(arguments, "OOI", &output_capsule, &connection_capsule, &stream_id))
+  if (!PyArg_ParseTuple(arguments, "OOI", &output_capsule, &connection_capsule,
+                        &stream_id))
     return NULL;
   NativeHandle* output = get_output(output_capsule);
   NativeHandle* connection = get_handle(connection_capsule, HANDLE_CONNECTION);
-  if (output == NULL || connection == NULL)
-    return NULL;
+  if (output == NULL || connection == NULL) return NULL;
   TiError error = TI_ERROR_INVALID_ARGUMENT;
-  Py_BEGIN_ALLOW_THREADS switch (output->kind) {
+  Py_BEGIN_ALLOW_THREADS
+  switch (output->kind) {
     case HANDLE_AUDIO_OUTPUT:
       error = tirtc_audio_output_attach((TiAudioOutput*)output->pointer,
                                         (TiRtcConn*)connection->pointer, (uint8_t)stream_id);
@@ -1038,19 +924,20 @@ static PyObject* py_output_attach_rtc(PyObject* module, PyObject* arguments) {
                                         (TiRtcConn*)connection->pointer, (uint8_t)stream_id);
       break;
     case HANDLE_ENCODED_AUDIO_OUTPUT:
-      error =
-          tirtc_encoded_audio_output_attach((TiEncodedAudioOutput*)output->pointer,
-                                            (TiRtcConn*)connection->pointer, (uint8_t)stream_id);
+      error = tirtc_encoded_audio_output_attach(
+          (TiEncodedAudioOutput*)output->pointer, (TiRtcConn*)connection->pointer,
+          (uint8_t)stream_id);
       break;
     case HANDLE_ENCODED_VIDEO_OUTPUT:
-      error =
-          tirtc_encoded_video_output_attach((TiEncodedVideoOutput*)output->pointer,
-                                            (TiRtcConn*)connection->pointer, (uint8_t)stream_id);
+      error = tirtc_encoded_video_output_attach(
+          (TiEncodedVideoOutput*)output->pointer, (TiRtcConn*)connection->pointer,
+          (uint8_t)stream_id);
       break;
     default:
       break;
   }
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static TiError output_detach_rtc(NativeHandle* output) {
@@ -1071,24 +958,22 @@ static TiError output_detach_rtc(NativeHandle* output) {
 static PyObject* py_output_detach_rtc(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* output = get_output(capsule);
-  if (output == NULL)
-    return NULL;
+  if (output == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = output_detach_rtc(output);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = output_detach_rtc(output);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_output_state(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* output = get_output(capsule);
-  if (output == NULL)
-    return NULL;
+  if (output == NULL) return NULL;
   TiOutputState state = TI_OUTPUT_STATE_IDLE;
   TiError error = TI_ERROR_INVALID_ARGUMENT;
   switch (output->kind) {
@@ -1113,29 +998,29 @@ static PyObject* py_output_state(PyObject* module, PyObject* arguments) {
 static PyObject* py_output_snapshot(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* output = get_handle(capsule, HANDLE_VIDEO_OUTPUT);
-  if (output == NULL)
-    return NULL;
+  if (output == NULL) return NULL;
   TiVideoSnapshotFile file = TI_VIDEO_SNAPSHOT_FILE_INITIALIZER;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_video_output_take_snapshot((TiVideoOutput*)output->pointer, &file);
-  Py_END_ALLOW_THREADS return Py_BuildValue(
-      "(is)", error, error == TI_ERROR_OK && file.file_path != NULL ? file.file_path : "");
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_video_output_take_snapshot((TiVideoOutput*)output->pointer, &file);
+  Py_END_ALLOW_THREADS
+  return Py_BuildValue("(is)", error,
+                       error == TI_ERROR_OK && file.file_path != NULL ? file.file_path : "");
 }
 
 static PyObject* py_close(PyObject* module, PyObject* argument) {
   (void)module;
-  NativeHandle* handle = (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
-  if (handle == NULL)
-    return NULL;
-  if (handle->pointer == NULL)
-    return PyLong_FromLong(TI_ERROR_OK);
+  NativeHandle* handle =
+      (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
+  if (handle == NULL) return NULL;
+  if (handle->pointer == NULL) return PyLong_FromLong(TI_ERROR_OK);
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = close_pointer(handle);
-  Py_END_ALLOW_THREADS if (error == TI_ERROR_OK) mark_closed(handle);
+  Py_BEGIN_ALLOW_THREADS
+  error = close_pointer(handle);
+  Py_END_ALLOW_THREADS
+  if (error == TI_ERROR_OK) mark_closed(handle);
   return PyLong_FromLong(error);
 }
 
@@ -1144,27 +1029,29 @@ static PyObject* py_rtc_recording_start(PyObject* module, PyObject* arguments) {
   PyObject* capsule;
   int video;
   int audio;
-  if (!PyArg_ParseTuple(arguments, "Oii", &capsule, &video, &audio))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "Oii", &capsule, &video, &audio)) return NULL;
   NativeHandle* connection = get_handle(capsule, HANDLE_CONNECTION);
-  if (connection == NULL)
-    return NULL;
-  NativeHandle* handle = handle_new(HANDLE_RTC_RECORDING, NULL);
-  if (handle == NULL)
-    return NULL;
-  PyObject* result = handle_result(handle);
-  if (result == NULL)
-    return NULL;
+  if (connection == NULL) return NULL;
   TiRtcStartRecordingOptions options = {(int32_t)video, (int32_t)audio};
   TiRtcRecordingTask* task = NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      tirtc_conn_start_recording((TiRtcConn*)connection->pointer, &options, &task);
-  Py_END_ALLOW_THREADS handle->pointer = task;
+  Py_BEGIN_ALLOW_THREADS
+  error = tirtc_conn_start_recording((TiRtcConn*)connection->pointer, &options, &task);
+  Py_END_ALLOW_THREADS
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+    if (task != NULL) (void)tirtc_recording_task_destroy(task);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  NativeHandle* handle = handle_new(HANDLE_RTC_RECORDING, NULL);
+  if (handle == NULL) {
+    (void)tirtc_recording_task_destroy(task);
+    return NULL;
+  }
+  handle->pointer = task;
+  PyObject* result_capsule = handle_capsule(handle);
+  if (result_capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, result_capsule);
+  Py_DECREF(result_capsule);
   return result;
 }
 
@@ -1173,63 +1060,76 @@ static PyObject* py_storage_recording_start(PyObject* module, PyObject* argument
   PyObject* capsule;
   int video;
   int audio;
-  if (!PyArg_ParseTuple(arguments, "Oii", &capsule, &video, &audio))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "Oii", &capsule, &video, &audio)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
-  NativeHandle* handle = handle_new(HANDLE_STORAGE_RECORDING, NULL);
-  if (handle == NULL)
-    return NULL;
-  PyObject* result = handle_result(handle);
-  if (result == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiCloudStorageStartRecordingOptions options = {(int32_t)video, (int32_t)audio};
   TiCloudStorageRecordingTask* task = NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_replay_start_recording(
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_cloud_storage_replay_start_recording(
       (TiCloudStorageReplay*)replay->pointer, &options, &task);
-  Py_END_ALLOW_THREADS handle->pointer = task;
+  Py_END_ALLOW_THREADS
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+    if (task != NULL) (void)ti_cloud_storage_recording_task_destroy(task);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  NativeHandle* handle = handle_new(HANDLE_STORAGE_RECORDING, NULL);
+  if (handle == NULL) {
+    (void)ti_cloud_storage_recording_task_destroy(task);
+    return NULL;
+  }
+  handle->pointer = task;
+  PyObject* result_capsule = handle_capsule(handle);
+  if (result_capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, result_capsule);
+  Py_DECREF(result_capsule);
   return result;
 }
 
 static PyObject* py_recording_stop(PyObject* module, PyObject* argument) {
   (void)module;
-  NativeHandle* handle = (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
-  if (handle == NULL)
-    return NULL;
+  NativeHandle* handle =
+      (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
+  if (handle == NULL) return NULL;
   if (handle->kind != HANDLE_RTC_RECORDING && handle->kind != HANDLE_STORAGE_RECORDING) {
     PyErr_SetString(PyExc_TypeError, "not a recording task");
     return NULL;
   }
   TiError stop_error;
+  TiError destroy_error;
   const char* file_path = "";
   int64_t duration_ms = 0;
   if (handle->kind == HANDLE_RTC_RECORDING) {
     TiRtcMp4File file = {NULL, 0};
-    Py_BEGIN_ALLOW_THREADS stop_error =
-        tirtc_recording_task_stop((TiRtcRecordingTask*)handle->pointer, &file);
-    Py_END_ALLOW_THREADS if (stop_error == TI_ERROR_OK) {
+    Py_BEGIN_ALLOW_THREADS
+    stop_error = tirtc_recording_task_stop((TiRtcRecordingTask*)handle->pointer, &file);
+    Py_END_ALLOW_THREADS
+    if (stop_error == TI_ERROR_OK) {
       file_path = file.file_path == NULL ? "" : file.file_path;
       duration_ms = file.duration_ms;
     }
   } else {
     TiCloudStorageMp4File file = {NULL, 0};
-    Py_BEGIN_ALLOW_THREADS stop_error =
-        ti_cloud_storage_recording_task_stop((TiCloudStorageRecordingTask*)handle->pointer, &file);
-    Py_END_ALLOW_THREADS if (stop_error == TI_ERROR_OK) {
+    Py_BEGIN_ALLOW_THREADS
+    stop_error = ti_cloud_storage_recording_task_stop(
+        (TiCloudStorageRecordingTask*)handle->pointer, &file);
+    Py_END_ALLOW_THREADS
+    if (stop_error == TI_ERROR_OK) {
       file_path = file.file_path == NULL ? "" : file.file_path;
       duration_ms = file.duration_ms;
     }
   }
   PyObject* path = PyUnicode_FromString(file_path);
-  if (path == NULL)
-    return NULL;
-  PyObject* result = Py_BuildValue("(iOL)", stop_error, path, duration_ms);
+  if (path == NULL) return NULL;
+  Py_BEGIN_ALLOW_THREADS
+  destroy_error = close_pointer(handle);
+  Py_END_ALLOW_THREADS
+  int destroyed = destroy_error == TI_ERROR_OK;
+  if (destroyed) mark_closed(handle);
+  TiError result_error = stop_error == TI_ERROR_OK ? destroy_error : stop_error;
+  PyObject* result = Py_BuildValue("(iOLO)", result_error, path, duration_ms,
+                                   destroyed ? Py_True : Py_False);
   Py_DECREF(path);
   return result;
 }
@@ -1238,27 +1138,24 @@ static PyObject* py_storage_create(PyObject* module, PyObject* argument) {
   (void)module;
   PyObject* encoded = NULL;
   const char* token = unicode_utf8(argument, &encoded);
-  if (token == NULL)
-    return NULL;
-  NativeHandle* handle = handle_new(HANDLE_STORAGE, NULL);
-  if (handle == NULL) {
-    Py_DECREF(encoded);
-    return NULL;
-  }
-  PyObject* result = handle_result(handle);
-  if (result == NULL) {
-    Py_DECREF(encoded);
-    return NULL;
-  }
+  if (token == NULL) return NULL;
   TiCloudStorage* storage = NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_create(token, &storage);
-  Py_END_ALLOW_THREADS handle->pointer = storage;
+  TiError error = ti_cloud_storage_create(token, &storage);
   Py_DECREF(encoded);
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+    if (storage != NULL) (void)ti_cloud_storage_destroy(storage);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  NativeHandle* handle = handle_new(HANDLE_STORAGE, NULL);
+  if (handle == NULL) {
+    (void)ti_cloud_storage_destroy(storage);
+    return NULL;
+  }
+  handle->pointer = storage;
+  PyObject* capsule = handle_capsule(handle);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
@@ -1266,15 +1163,11 @@ static PyObject* py_storage_update_token(PyObject* module, PyObject* arguments) 
   (void)module;
   PyObject* capsule;
   const char* token;
-  if (!PyArg_ParseTuple(arguments, "Os", &capsule, &token))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "Os", &capsule, &token)) return NULL;
   NativeHandle* storage = get_handle(capsule, HANDLE_STORAGE);
-  if (storage == NULL)
-    return NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_cloud_storage_update_token((TiCloudStorage*)storage->pointer, token);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  if (storage == NULL) return NULL;
+  return PyLong_FromLong(
+      ti_cloud_storage_update_token((TiCloudStorage*)storage->pointer, token));
 }
 
 static PyObject* py_storage_list_start(PyObject* module, PyObject* arguments) {
@@ -1285,35 +1178,31 @@ static PyObject* py_storage_list_start(PyObject* module, PyObject* arguments) {
   PyObject* second;
   PyObject* timezone;
   PyObject* callback;
-  if (!PyArg_ParseTuple(arguments, "OsOOOO", &storage_capsule, &kind, &first, &second, &timezone,
-                        &callback))
+  if (!PyArg_ParseTuple(arguments, "OsOOOO", &storage_capsule, &kind, &first, &second,
+                        &timezone, &callback))
     return NULL;
   NativeHandle* storage = get_handle(storage_capsule, HANDLE_STORAGE);
-  if (storage == NULL)
-    return NULL;
-  HandleKind request_kind =
-      strcmp(kind, "recordings") == 0 ? HANDLE_RECORDING_REQUEST : HANDLE_DAYS_REQUEST;
+  if (storage == NULL) return NULL;
+  HandleKind request_kind = strcmp(kind, "recordings") == 0 ? HANDLE_RECORDING_REQUEST
+                                                              : HANDLE_DAYS_REQUEST;
   NativeHandle* request = handle_new(request_kind, callback);
-  if (request == NULL)
-    return NULL;
-  PyObject* result = handle_result(request);
-  if (result == NULL)
-    return NULL;
+  if (request == NULL) return NULL;
   TiError error;
   if (request_kind == HANDLE_RECORDING_REQUEST) {
     int64_t start = PyLong_AsLongLong(first);
     int64_t end = PyLong_AsLongLong(second);
     if (PyErr_Occurred()) {
-      Py_DECREF(result);
+      Py_DECREF(callback);
+      free(request);
       return NULL;
     }
     TiCloudStorageRecordingRequestCallbacks callbacks =
         TI_CLOUD_STORAGE_RECORDING_REQUEST_CALLBACKS_INITIALIZER;
     callbacks.on_completed = request_completed_recordings;
     TiCloudStorageRecordingRequest* pointer = NULL;
-    Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_list_recordings(
-        (TiCloudStorage*)storage->pointer, start, end, &callbacks, request, &pointer);
-    Py_END_ALLOW_THREADS request->pointer = pointer;
+    error = ti_cloud_storage_list_recordings((TiCloudStorage*)storage->pointer, start, end,
+                                             &callbacks, request, &pointer);
+    request->pointer = pointer;
   } else {
     PyObject* encoded_start = NULL;
     PyObject* encoded_end = NULL;
@@ -1325,53 +1214,59 @@ static PyObject* py_storage_list_start(PyObject* module, PyObject* arguments) {
       Py_XDECREF(encoded_start);
       Py_XDECREF(encoded_end);
       Py_XDECREF(encoded_zone);
-      Py_DECREF(result);
+      Py_DECREF(callback);
+      free(request);
       return NULL;
     }
     TiCloudStorageRecordingDaysRequestCallbacks callbacks =
         TI_CLOUD_STORAGE_RECORDING_DAYS_REQUEST_CALLBACKS_INITIALIZER;
     callbacks.on_completed = request_completed_days;
     TiCloudStorageRecordingDaysRequest* pointer = NULL;
-    Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_list_recording_days(
+    error = ti_cloud_storage_list_recording_days(
         (TiCloudStorage*)storage->pointer, start, end, zone, &callbacks, request, &pointer);
-    Py_END_ALLOW_THREADS request->pointer = pointer;
+    request->pointer = pointer;
     Py_DECREF(encoded_start);
     Py_DECREF(encoded_end);
     Py_DECREF(encoded_zone);
   }
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, request);
+    abandon_handle(request);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  PyObject* capsule = handle_capsule(request);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
 static PyObject* py_request_cancel(PyObject* module, PyObject* argument) {
   (void)module;
-  NativeHandle* request = (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
-  if (request == NULL)
-    return NULL;
+  NativeHandle* request =
+      (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
+  if (request == NULL) return NULL;
   TiError error;
   if (request->kind != HANDLE_RECORDING_REQUEST && request->kind != HANDLE_DAYS_REQUEST) {
     PyErr_SetString(PyExc_TypeError, "not a list request");
     return NULL;
   }
-  Py_BEGIN_ALLOW_THREADS if (request->kind == HANDLE_RECORDING_REQUEST) {
+  Py_BEGIN_ALLOW_THREADS
+  if (request->kind == HANDLE_RECORDING_REQUEST) {
     error = ti_cloud_storage_recording_request_cancel(
         (TiCloudStorageRecordingRequest*)request->pointer);
-  }
-  else {
+  } else {
     error = ti_cloud_storage_recording_days_request_cancel(
         (TiCloudStorageRecordingDaysRequest*)request->pointer);
   }
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_request_result(PyObject* module, PyObject* argument) {
   (void)module;
-  NativeHandle* request = (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
-  if (request == NULL)
-    return NULL;
+  NativeHandle* request =
+      (NativeHandle*)PyCapsule_GetPointer(argument, TIRTC_CAPSULE_NAME);
+  if (request == NULL) return NULL;
   TiError error = TI_ERROR_OK;
   size_t count = 0;
   PyObject* values = NULL;
@@ -1379,8 +1274,7 @@ static PyObject* py_request_result(PyObject* module, PyObject* argument) {
     TiError terminal = TI_ERROR_OK;
     error = ti_cloud_storage_recording_request_get_error(
         (TiCloudStorageRecordingRequest*)request->pointer, &terminal);
-    if (error == TI_ERROR_OK)
-      error = terminal;
+    if (error == TI_ERROR_OK) error = terminal;
     if (error == TI_ERROR_OK)
       error = ti_cloud_storage_recording_request_get_count(
           (TiCloudStorageRecordingRequest*)request->pointer, &count);
@@ -1388,8 +1282,7 @@ static PyObject* py_request_result(PyObject* module, PyObject* argument) {
       error = TI_ERROR_RESOURCE_EXHAUSTED;
     }
     values = PyList_New(error == TI_ERROR_OK ? (Py_ssize_t)count : 0);
-    if (values == NULL)
-      return NULL;
+    if (values == NULL) return NULL;
     for (size_t index = 0; error == TI_ERROR_OK && index < count; ++index) {
       TiCloudStorageRecordingRange range;
       error = ti_cloud_storage_recording_request_get_recording(
@@ -1407,8 +1300,7 @@ static PyObject* py_request_result(PyObject* module, PyObject* argument) {
     TiError terminal = TI_ERROR_OK;
     error = ti_cloud_storage_recording_days_request_get_error(
         (TiCloudStorageRecordingDaysRequest*)request->pointer, &terminal);
-    if (error == TI_ERROR_OK)
-      error = terminal;
+    if (error == TI_ERROR_OK) error = terminal;
     if (error == TI_ERROR_OK)
       error = ti_cloud_storage_recording_days_request_get_count(
           (TiCloudStorageRecordingDaysRequest*)request->pointer, &count);
@@ -1416,14 +1308,14 @@ static PyObject* py_request_result(PyObject* module, PyObject* argument) {
       error = TI_ERROR_RESOURCE_EXHAUSTED;
     }
     values = PyList_New(error == TI_ERROR_OK ? (Py_ssize_t)count : 0);
-    if (values == NULL)
-      return NULL;
+    if (values == NULL) return NULL;
     for (size_t index = 0; error == TI_ERROR_OK && index < count; ++index) {
       TiCloudStorageRecordingDay day;
       error = ti_cloud_storage_recording_days_request_get_day(
           (TiCloudStorageRecordingDaysRequest*)request->pointer, index, &day);
       if (error == TI_ERROR_OK) {
-        PyObject* item = Py_BuildValue("(sO)", day.date, day.has_recording ? Py_True : Py_False);
+        PyObject* item = Py_BuildValue("(sO)", day.date,
+                                       day.has_recording ? Py_True : Py_False);
         if (item == NULL) {
           Py_DECREF(values);
           return NULL;
@@ -1435,13 +1327,11 @@ static PyObject* py_request_result(PyObject* module, PyObject* argument) {
     PyErr_SetString(PyExc_TypeError, "not a list request");
     return NULL;
   }
-  if (values == NULL)
-    return NULL;
+  if (values == NULL) return NULL;
   if (error != TI_ERROR_OK) {
     Py_DECREF(values);
     values = PyList_New(0);
-    if (values == NULL)
-      return NULL;
+    if (values == NULL) return NULL;
   }
   PyObject* result = Py_BuildValue("(iO)", error, values);
   Py_DECREF(values);
@@ -1452,34 +1342,29 @@ static PyObject* py_replay_create(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* storage_capsule;
   PyObject* callback;
-  int time_enabled;
-  if (!PyArg_ParseTuple(arguments, "OOp", &storage_capsule, &callback, &time_enabled))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OO", &storage_capsule, &callback)) return NULL;
   NativeHandle* storage = get_handle(storage_capsule, HANDLE_STORAGE);
-  if (storage == NULL)
-    return NULL;
+  if (storage == NULL) return NULL;
   NativeHandle* replay = handle_new(HANDLE_REPLAY, callback);
-  if (replay == NULL)
-    return NULL;
-  PyObject* result = handle_result(replay);
-  if (result == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiCloudStorageReplay* pointer = NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_cloud_storage_replay_create((TiCloudStorage*)storage->pointer, &pointer);
+  TiError error = ti_cloud_storage_replay_create((TiCloudStorage*)storage->pointer, &pointer);
   if (error == TI_ERROR_OK) {
     TiCloudStorageReplayCallbacks callbacks = TI_CLOUD_STORAGE_REPLAY_CALLBACKS_INITIALIZER;
-    callbacks.on_time_changed = time_enabled ? replay_on_time : NULL;
+    callbacks.on_time_changed = replay_on_time;
     callbacks.on_completed = replay_on_completed;
     callbacks.on_error = replay_on_error;
     error = ti_cloud_storage_replay_set_callbacks(pointer, &callbacks, replay);
   }
-  Py_END_ALLOW_THREADS replay->pointer = pointer;
+  replay->pointer = pointer;
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, replay);
+    abandon_handle(replay);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  PyObject* capsule = handle_capsule(replay);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
@@ -1489,33 +1374,34 @@ static PyObject* py_replay_play(PyObject* module, PyObject* arguments) {
   int64_t start;
   int64_t end;
   int64_t initial;
-  if (!PyArg_ParseTuple(arguments, "OLLL", &capsule, &start, &end, &initial))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OLLL", &capsule, &start, &end, &initial)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_cloud_storage_replay_play_at((TiCloudStorageReplay*)replay->pointer, start, end, initial);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_cloud_storage_replay_play_at(
+      (TiCloudStorageReplay*)replay->pointer, start, end, initial);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
-static PyObject* replay_simple(PyObject* arguments, TiError (*operation)(TiCloudStorageReplay*)) {
+static PyObject* replay_simple(PyObject* arguments,
+                               TiError (*operation)(TiCloudStorageReplay*)) {
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = operation((TiCloudStorageReplay*)replay->pointer);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = operation((TiCloudStorageReplay*)replay->pointer);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
-#define REPLAY_SIMPLE_METHOD(name, native_name)                  \
-  static PyObject* name(PyObject* module, PyObject* arguments) { \
-    (void)module;                                                \
-    return replay_simple(arguments, native_name);                \
+#define REPLAY_SIMPLE_METHOD(name, native_name)                              \
+  static PyObject* name(PyObject* module, PyObject* arguments) {             \
+    (void)module;                                                            \
+    return replay_simple(arguments, native_name);                            \
   }
 
 REPLAY_SIMPLE_METHOD(py_replay_pause, ti_cloud_storage_replay_pause)
@@ -1526,53 +1412,49 @@ static PyObject* py_replay_seek(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
   int64_t value;
-  if (!PyArg_ParseTuple(arguments, "OL", &capsule, &value))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OL", &capsule, &value)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_cloud_storage_replay_seek((TiCloudStorageReplay*)replay->pointer, value);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_cloud_storage_replay_seek((TiCloudStorageReplay*)replay->pointer, value);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_replay_set_speed(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
   unsigned int value;
-  if (!PyArg_ParseTuple(arguments, "OI", &capsule, &value))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "OI", &capsule, &value)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_replay_set_speed(
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_cloud_storage_replay_set_speed(
       (TiCloudStorageReplay*)replay->pointer, (TiCloudStorageReplaySpeed)value);
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_replay_get_speed(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   TiCloudStorageReplaySpeed value = TI_CLOUD_STORAGE_REPLAY_SPEED_1X;
-  TiError error = ti_cloud_storage_replay_get_speed((TiCloudStorageReplay*)replay->pointer, &value);
+  TiError error = ti_cloud_storage_replay_get_speed(
+      (TiCloudStorageReplay*)replay->pointer, &value);
   return Py_BuildValue("(iI)", error, value);
 }
 
 static PyObject* py_replay_current_time(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
-  if (replay == NULL)
-    return NULL;
+  if (replay == NULL) return NULL;
   uint8_t present = 0;
   int64_t value = 0;
   TiError error = ti_cloud_storage_replay_get_current_time_ms(
@@ -1589,46 +1471,46 @@ static PyObject* py_output_attach_storage(PyObject* module, PyObject* arguments)
     return NULL;
   NativeHandle* output = get_output(output_capsule);
   NativeHandle* replay = get_handle(replay_capsule, HANDLE_REPLAY);
-  if (output == NULL || replay == NULL)
-    return NULL;
+  if (output == NULL || replay == NULL) return NULL;
   TiError error = TI_ERROR_INVALID_ARGUMENT;
-  Py_BEGIN_ALLOW_THREADS switch (output->kind) {
+  Py_BEGIN_ALLOW_THREADS
+  switch (output->kind) {
     case HANDLE_AUDIO_OUTPUT:
-      error = ti_cloud_storage_audio_output_attach((TiAudioOutput*)output->pointer,
-                                                   (TiCloudStorageReplay*)replay->pointer,
-                                                   (uint8_t)channel_id);
+      error = ti_cloud_storage_audio_output_attach(
+          (TiAudioOutput*)output->pointer, (TiCloudStorageReplay*)replay->pointer,
+          (uint8_t)channel_id);
       break;
     case HANDLE_VIDEO_OUTPUT:
-      error = ti_cloud_storage_video_output_attach((TiVideoOutput*)output->pointer,
-                                                   (TiCloudStorageReplay*)replay->pointer,
-                                                   (uint8_t)channel_id);
+      error = ti_cloud_storage_video_output_attach(
+          (TiVideoOutput*)output->pointer, (TiCloudStorageReplay*)replay->pointer,
+          (uint8_t)channel_id);
       break;
     case HANDLE_ENCODED_AUDIO_OUTPUT:
-      error = ti_cloud_storage_encoded_audio_output_attach((TiEncodedAudioOutput*)output->pointer,
-                                                           (TiCloudStorageReplay*)replay->pointer,
-                                                           (uint8_t)channel_id);
+      error = ti_cloud_storage_encoded_audio_output_attach(
+          (TiEncodedAudioOutput*)output->pointer, (TiCloudStorageReplay*)replay->pointer,
+          (uint8_t)channel_id);
       break;
     case HANDLE_ENCODED_VIDEO_OUTPUT:
-      error = ti_cloud_storage_encoded_video_output_attach((TiEncodedVideoOutput*)output->pointer,
-                                                           (TiCloudStorageReplay*)replay->pointer,
-                                                           (uint8_t)channel_id);
+      error = ti_cloud_storage_encoded_video_output_attach(
+          (TiEncodedVideoOutput*)output->pointer, (TiCloudStorageReplay*)replay->pointer,
+          (uint8_t)channel_id);
       break;
     default:
       break;
   }
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_output_detach_storage(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* output = get_output(capsule);
-  if (output == NULL)
-    return NULL;
+  if (output == NULL) return NULL;
   TiError error = TI_ERROR_INVALID_ARGUMENT;
-  Py_BEGIN_ALLOW_THREADS switch (output->kind) {
+  Py_BEGIN_ALLOW_THREADS
+  switch (output->kind) {
     case HANDLE_AUDIO_OUTPUT:
       error = ti_cloud_storage_audio_output_detach((TiAudioOutput*)output->pointer);
       break;
@@ -1636,15 +1518,18 @@ static PyObject* py_output_detach_storage(PyObject* module, PyObject* arguments)
       error = ti_cloud_storage_video_output_detach((TiVideoOutput*)output->pointer);
       break;
     case HANDLE_ENCODED_AUDIO_OUTPUT:
-      error = ti_cloud_storage_encoded_audio_output_detach((TiEncodedAudioOutput*)output->pointer);
+      error = ti_cloud_storage_encoded_audio_output_detach(
+          (TiEncodedAudioOutput*)output->pointer);
       break;
     case HANDLE_ENCODED_VIDEO_OUTPUT:
-      error = ti_cloud_storage_encoded_video_output_detach((TiEncodedVideoOutput*)output->pointer);
+      error = ti_cloud_storage_encoded_video_output_detach(
+          (TiEncodedVideoOutput*)output->pointer);
       break;
     default:
       break;
   }
-  Py_END_ALLOW_THREADS return PyLong_FromLong(error);
+  Py_END_ALLOW_THREADS
+  return PyLong_FromLong(error);
 }
 
 static PyObject* py_export_create(PyObject* module, PyObject* arguments) {
@@ -1655,41 +1540,38 @@ static PyObject* py_export_create(PyObject* module, PyObject* arguments) {
   int video;
   int audio;
   PyObject* callback;
-  if (!PyArg_ParseTuple(arguments, "OLLiiO", &storage_capsule, &start, &end, &video, &audio,
-                        &callback))
+  if (!PyArg_ParseTuple(arguments, "OLLiiO", &storage_capsule, &start, &end, &video,
+                        &audio, &callback))
     return NULL;
   NativeHandle* storage = get_handle(storage_capsule, HANDLE_STORAGE);
-  if (storage == NULL)
-    return NULL;
+  if (storage == NULL) return NULL;
   NativeHandle* handle = handle_new(HANDLE_EXPORT, callback);
-  if (handle == NULL)
-    return NULL;
-  PyObject* result = handle_result(handle);
-  if (result == NULL)
-    return NULL;
+  if (handle == NULL) return NULL;
   TiCloudStorageExportOptions options = {start, end, video, audio};
   TiCloudStorageExportCallbacks callbacks = TI_CLOUD_STORAGE_EXPORT_CALLBACKS_INITIALIZER;
+  callbacks.on_progress = export_on_progress;
   callbacks.on_completed = export_on_completed;
   TiCloudStorageExportTask* task = NULL;
-  TiError error;
-  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_export_recording(
+  TiError error = ti_cloud_storage_export_recording(
       (TiCloudStorage*)storage->pointer, &options, &callbacks, handle, &task);
-  Py_END_ALLOW_THREADS handle->pointer = task;
+  handle->pointer = task;
   if (error != TI_ERROR_OK) {
-    discard_handle_result(result, handle);
+    abandon_handle(handle);
     return Py_BuildValue("(iO)", error, Py_None);
   }
+  PyObject* capsule = handle_capsule(handle);
+  if (capsule == NULL) return NULL;
+  PyObject* result = Py_BuildValue("(iO)", TI_ERROR_OK, capsule);
+  Py_DECREF(capsule);
   return result;
 }
 
 static PyObject* py_export_progress(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* task = get_handle(capsule, HANDLE_EXPORT);
-  if (task == NULL)
-    return NULL;
+  if (task == NULL) return NULL;
   double progress = 0;
   TiError error = ti_cloud_storage_export_task_get_progress(
       (TiCloudStorageExportTask*)task->pointer, &progress);
@@ -1699,31 +1581,28 @@ static PyObject* py_export_progress(PyObject* module, PyObject* arguments) {
 static PyObject* py_export_stop(PyObject* module, PyObject* arguments) {
   (void)module;
   PyObject* capsule;
-  if (!PyArg_ParseTuple(arguments, "O", &capsule))
-    return NULL;
+  if (!PyArg_ParseTuple(arguments, "O", &capsule)) return NULL;
   NativeHandle* task = get_handle(capsule, HANDLE_EXPORT);
-  if (task == NULL)
-    return NULL;
+  if (task == NULL) return NULL;
   TiCloudStorageMp4File file = {NULL, 0};
   TiError error;
-  Py_BEGIN_ALLOW_THREADS error =
-      ti_cloud_storage_export_task_stop((TiCloudStorageExportTask*)task->pointer, &file);
-  Py_END_ALLOW_THREADS return Py_BuildValue(
-      "(isL)", error, error == TI_ERROR_OK && file.file_path != NULL ? file.file_path : "",
-      error == TI_ERROR_OK ? file.duration_ms : 0);
+  Py_BEGIN_ALLOW_THREADS
+  error = ti_cloud_storage_export_task_stop((TiCloudStorageExportTask*)task->pointer, &file);
+  Py_END_ALLOW_THREADS
+  return Py_BuildValue("(isL)", error,
+                       error == TI_ERROR_OK && file.file_path != NULL ? file.file_path : "",
+                       error == TI_ERROR_OK ? file.duration_ms : 0);
 }
 
 static PyMethodDef module_methods[] = {
-    {"mark_finalizing", py_mark_finalizing, METH_NOARGS, NULL},
     {"error_name", py_error_name, METH_O, NULL},
     {"rtc_initialize", py_rtc_initialize, METH_VARARGS, NULL},
     {"rtc_shutdown", py_rtc_shutdown, METH_NOARGS, NULL},
     {"storage_initialize", py_storage_initialize, METH_VARARGS, NULL},
     {"storage_shutdown", py_storage_shutdown, METH_NOARGS, NULL},
     {"upload_logs", py_upload_logs, METH_NOARGS, NULL},
-    {"write_log", py_write_log, METH_VARARGS, NULL},
     {"delete_media_file", py_delete_media_file, METH_O, NULL},
-    {"conn_create", py_conn_create, METH_VARARGS, NULL},
+    {"conn_create", py_conn_create, METH_O, NULL},
     {"conn_connect", py_conn_connect, METH_VARARGS, NULL},
     {"conn_disconnect", py_conn_disconnect, METH_VARARGS, NULL},
     {"conn_send_command", py_conn_send_command, METH_VARARGS, NULL},
@@ -1765,13 +1644,20 @@ static PyMethodDef module_methods[] = {
 };
 
 static struct PyModuleDef module_definition = {
-    PyModuleDef_HEAD_INIT, "_native", NULL, 0, module_methods, NULL, NULL, NULL, NULL,
+    PyModuleDef_HEAD_INIT,
+    "_native",
+    NULL,
+    0,
+    module_methods,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
 };
 
 PyMODINIT_FUNC PyInit__native(void) {
   frame_buffer_type = PyType_FromSpec(&frame_buffer_spec);
-  if (frame_buffer_type == NULL)
-    return NULL;
+  if (frame_buffer_type == NULL) return NULL;
   PyObject* module = PyModule_Create(&module_definition);
   if (module == NULL) {
     Py_DECREF(frame_buffer_type);

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-import os
 import queue
 import sys
 import threading
@@ -13,8 +12,6 @@ from typing import Any
 
 
 _callback_state = threading.local()
-_executor_lock = threading.Lock()
-_executor: _CallbackExecutor | None = None
 
 
 @contextmanager
@@ -48,22 +45,11 @@ def _report_unraisable(error: BaseException, callback: object) -> None:
 
 class _CallbackExecutor:
     def __init__(self) -> None:
-        self._pid = os.getpid()
         self._ready: queue.SimpleQueue[weakref.ReferenceType[_Dispatcher]] = queue.SimpleQueue()
-        self._threads = tuple(
-            threading.Thread(
-                target=self._run,
-                name=f"tirtc-callback-{index}",
-                daemon=True,
-            )
-            for index in range(2)
+        self._thread = threading.Thread(
+            target=self._run, name="tirtc-callbacks", daemon=True
         )
-        for thread in self._threads:
-            thread.start()
-
-    @property
-    def current_process(self) -> bool:
-        return self._pid == os.getpid()
+        self._thread.start()
 
     def schedule(self, dispatcher: _Dispatcher) -> None:
         self._ready.put(weakref.ref(dispatcher))
@@ -72,31 +58,11 @@ class _CallbackExecutor:
         while True:
             reference = self._ready.get()
             dispatcher = reference()
-            if dispatcher is None:
-                continue
-            try:
+            if dispatcher is not None:
                 dispatcher._drain_one()
-            except BaseException as error:
-                _report_unraisable(error, dispatcher)
 
 
-def _get_executor() -> _CallbackExecutor:
-    global _executor
-    with _executor_lock:
-        if _executor is None or not _executor.current_process:
-            _executor = _CallbackExecutor()
-        return _executor
-
-
-def _after_fork_child() -> None:
-    global _callback_state, _executor, _executor_lock
-    _callback_state = threading.local()
-    _executor = None
-    _executor_lock = threading.Lock()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_after_fork_child)
+_EXECUTOR = _CallbackExecutor()
 
 
 class _Dispatcher:
@@ -107,27 +73,17 @@ class _Dispatcher:
         "_dropped_frame",
         "_events",
         "_executing",
-        "_frame_capacity",
-        "_frame_count",
         "_handler",
         "_lock",
         "_scheduled",
     )
 
-    def __init__(
-        self,
-        handler: Callable[..., None],
-        *,
-        capacity: int = 64,
-        frame_capacity: int | None = None,
-    ) -> None:
+    def __init__(self, handler: Callable[..., None], *, capacity: int = 64) -> None:
         self._capacity = capacity
-        self._frame_capacity = capacity if frame_capacity is None else frame_capacity
         self._closed = False
         self._dropped_frame = False
         self._events: deque[tuple[str, tuple[Any, ...], bool, bool]] = deque()
         self._executing = False
-        self._frame_count = 0
         self._handler = weakref.WeakMethod(handler)
         self._lock = threading.Condition()
         self._scheduled = False
@@ -155,9 +111,6 @@ class _Dispatcher:
                     if current[0] == kind and not current[2]:
                         self._events[index] = (kind, values, frame, terminal)
                         return True
-            if frame and self._frame_count >= self._frame_capacity:
-                self._dropped_frame = True
-                return False
             if len(self._events) >= self._capacity:
                 if frame:
                     self._dropped_frame = True
@@ -166,7 +119,6 @@ class _Dispatcher:
                     if not current[3]:
                         del self._events[index]
                         if current[2]:
-                            self._frame_count -= 1
                             self._dropped_frame = True
                         break
                 else:
@@ -178,23 +130,19 @@ class _Dispatcher:
                 values = (*values[:-1], True)
                 self._dropped_frame = False
             self._events.append((kind, values, frame, terminal))
-            if frame:
-                self._frame_count += 1
             if not self._scheduled:
                 self._scheduled = True
                 schedule = True
         if schedule:
-            _get_executor().schedule(self)
+            _EXECUTOR.schedule(self)
         return True
 
     def _drain_one(self) -> None:
         with self._lock:
-            if not self._events:
+            if self._closed or not self._events:
                 self._scheduled = False
                 return
-            kind, values, frame, _ = self._events.popleft()
-            if frame:
-                self._frame_count -= 1
+            kind, values, _, _ = self._events.popleft()
             self._executing = True
         handler = self._handler()
         if handler is not None:
@@ -204,26 +152,22 @@ class _Dispatcher:
                 _report_unraisable(error, handler)
         with self._lock:
             self._executing = False
-            pending = bool(self._events)
+            pending = bool(self._events) and not self._closed
             if not pending:
                 self._scheduled = False
             self._lock.notify_all()
         if pending:
-            _get_executor().schedule(self)
+            _EXECUTOR.schedule(self)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            while self._executing or self._events:
-                self._lock.wait()
-
-    def discard(self) -> None:
-        with self._lock:
-            self._closed = True
             self._events.clear()
-            self._frame_count = 0
             self._scheduled = False
-            self._lock.notify_all()
+            if threading.current_thread() is _EXECUTOR._thread:
+                return
+            while self._executing:
+                self._lock.wait()
 
 
 def _native_sink(dispatcher: _Dispatcher) -> Callable[..., None]:
@@ -238,7 +182,7 @@ def _native_sink(dispatcher: _Dispatcher) -> Callable[..., None]:
             *values,
             frame=kind.endswith("_frame"),
             terminal=kind in {"completed", "error"},
-            latest=kind in {"state", "time"},
+            latest=kind in {"state", "time", "progress"},
         )
 
     return sink

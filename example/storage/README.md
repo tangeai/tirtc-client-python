@@ -14,4 +14,4 @@ python main.py \
   --end-ms <unix-ms>
 ```
 
-服务返回 Token 过期时，程序从 `TI_CLOUD_STORAGE_REFRESHED_ACCESS_TOKEN` 读取新 Token，调用 `update_token()` 后显式重试；SDK 不自动刷新。`--help` 不需要凭据。默认音频 channel 是 0，视频 channel 是 1；两者都是 `0..255`，也可以使用相同数值。程序在三分钟内没有取得完整回调或终态时以非零状态退出，凭据内容不会写入普通输出。
+服务返回 Token 过期时，程序从 `TI_CLOUD_STORAGE_REFRESHED_ACCESS_TOKEN` 读取新 Token，调用 `update_token()` 后显式重试；SDK 不自动刷新。`--help` 不需要凭据。默认音频 channel 是 0，视频 channel 是 1；两者必须是不同的 0..255 channel ID。程序在三分钟内没有取得完整回调或终态时以非零状态退出，凭据内容不会写入普通输出。

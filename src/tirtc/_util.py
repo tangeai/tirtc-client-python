@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import math
-import time
 from typing import Any
 
-from ._errors import _error_from_code, _timeout_error
+from ._errors import _error_from_code
 from ._runtime import _error_name
 
 
@@ -79,15 +77,7 @@ def _aware_datetime(value: object, name: str) -> datetime:
 
 def _datetime_ms(value: object, name: str) -> int:
     moment = _aware_datetime(value, name)
-    delta = moment - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    microseconds = (
-        delta.days * 86_400_000_000
-        + delta.seconds * 1_000_000
-        + delta.microseconds
-    )
-    if microseconds % 1000:
-        raise ValueError(f"{name} must use whole milliseconds")
-    milliseconds = microseconds // 1000
+    milliseconds = int(moment.timestamp() * 1000)
     if milliseconds < 0:
         raise ValueError(f"{name} must be at or after the Unix epoch")
     return milliseconds
@@ -96,60 +86,11 @@ def _datetime_ms(value: object, name: str) -> int:
 def _datetime_from_us(value: int, present: bool) -> datetime | None:
     if not present:
         return None
-    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value)
+    return datetime.fromtimestamp(value / 1_000_000, timezone.utc)
 
 
 def _datetime_from_ms(value: int) -> datetime:
-    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=value)
-
-
-def _timeout(value: float | None, name: str = "timeout") -> float | None:
-    if value is None:
-        return None
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise TypeError(f"{name} must be float or None")
-    timeout = float(value)
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(f"{name} must be finite and positive")
-    return timeout
-
-
-def _retry_in_use(
-    operation,
-    *arguments: object,
-    _timeout_seconds: float = 5.0,
-    _clock=time.monotonic,
-    _sleep=time.sleep,
-) -> None:
-    result = _retry_in_use_result(
-        operation,
-        *arguments,
-        _timeout_seconds=_timeout_seconds,
-        _clock=_clock,
-        _sleep=_sleep,
-    )
-    _check_code(int(result))
-
-
-def _retry_in_use_result(
-    operation,
-    *arguments: object,
-    _timeout_seconds: float = 5.0,
-    _clock=time.monotonic,
-    _sleep=time.sleep,
-) -> Any:
-    deadline = _clock() + _timeout_seconds
-    delay = 0.001
-    while True:
-        result = operation(*arguments)
-        code = int(result[0] if isinstance(result, tuple) else result)
-        if code != 6026:
-            return result
-        remaining = deadline - _clock()
-        if remaining <= 0:
-            raise _timeout_error()
-        _sleep(min(delay, remaining))
-        delay = min(delay * 2, 0.02)
+    return datetime.fromtimestamp(value / 1000, timezone.utc)
 
 
 def _enum(value: object, enum_type: type, name: str) -> Any:
