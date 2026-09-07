@@ -5,19 +5,27 @@ from collections.abc import Callable
 import logging
 import os
 from pathlib import Path
+import sys
 import threading
-from typing import Self
+from typing import Self, final
+import warnings
 
 from . import _native
+from . import _build_identity
 from ._dispatch import _Dispatcher, _active_callback, _callback_owner, _native_sink
 from ._errors import (
-    InUseError,
     TiRTCError,
-    _closed_error,
     _error_from_code,
     _in_use_error,
 )
-from ._runtime import _error_name, _initialize, _shutdown
+from ._lifecycle import _CloseCoordinator, _copy_error
+from ._runtime import (
+    _check_process,
+    _error_name,
+    _initialize,
+    _process_is_current,
+    _shutdown,
+)
 from ._util import (
     _buffer,
     _callable,
@@ -27,6 +35,8 @@ from ._util import (
     _enum,
     _integer,
     _nonempty_string,
+    _retry_in_use,
+    _retry_in_use_result,
     _stream_id,
 )
 from ._values import (
@@ -70,6 +80,7 @@ def initialize(
     console_log_enabled: bool = False,
 ) -> None:
     _initialize("rtc", app_id, cache_dir, endpoint, console_log_enabled)
+    _build_identity.log("rtc", _native)
     _LOGGER.info("RTC initialized")
 
 
@@ -79,12 +90,14 @@ def shutdown() -> None:
 
 
 def upload_logs() -> str:
+    _check_process()
     code, log_id = _native.upload_logs()
     _check_code(code)
     return str(log_id)
 
 
 def error_name(code: int) -> str:
+    _check_process()
     code = _integer(code, "code", minimum=-(2**31), maximum=2**31 - 1)
     return _error_name(code)
 
@@ -106,6 +119,7 @@ class _TemporaryMediaFile:
         return self._path
 
     def delete(self) -> None:
+        _check_process()
         with self._lock:
             if self._deleted:
                 return
@@ -119,6 +133,7 @@ class _TemporaryMediaFile:
         self.delete()
 
 
+@final
 class RecordingFile(_TemporaryMediaFile):
     @classmethod
     def _create(cls, path: str, duration_ms: int) -> RecordingFile:
@@ -131,46 +146,84 @@ class RecordingFile(_TemporaryMediaFile):
         return self._duration
 
 
+@final
 class SnapshotFile(_TemporaryMediaFile):
     pass
 
 
+@final
 class RecordingTask:
     def __init__(self) -> None:
         raise TypeError("RecordingTask values are created by Connection.start_recording()")
 
     @classmethod
-    def _create(cls, handle: object, parent: Connection) -> RecordingTask:
+    def _prepare(cls, parent: Connection) -> RecordingTask:
         self = object.__new__(cls)
-        self._handle = handle
+        self._handle = None
         self._parent = parent
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._close = _CloseCoordinator(self._lock)
         self._result: RecordingFile | None = None
         self._error: BaseException | None = None
-        self._finished = False
+        self._stopped = False
+        self._parent_finished = False
+        return self
+
+    @classmethod
+    def _create(cls, handle: object, parent: Connection) -> RecordingTask:
+        self = cls._prepare(parent)
+        self._handle = handle
         return self
 
     def stop(self) -> RecordingFile:
+        _check_process()
+        if _callback_owner() is self._parent:
+            raise _in_use_error()
         with self._lock:
-            if self._finished:
+            generation = self._close.begin()
+            if generation is None:
                 if self._error is not None:
-                    raise self._error
+                    raise _copy_error(self._error)
                 assert self._result is not None
                 return self._result
-            code, path, duration_ms, destroyed = _native.recording_stop(self._handle)
-            error = _error_from_code(code, _error_name(code)) if code else None
-            if destroyed:
-                self._finished = True
-                self._result = RecordingFile._create(str(path), int(duration_ms)) if not code else None
-                self._error = error
+        try:
+            if not self._stopped:
+                code, path, duration_ms = _retry_in_use_result(
+                    _native.recording_stop, self._handle
+                )
+                self._error = _error_from_code(code, _error_name(code)) if code else None
+                self._result = (
+                    RecordingFile._create(str(path), int(duration_ms)) if not code else None
+                )
+                self._stopped = True
+            _retry_in_use(_native.close, self._handle)
+            if not self._parent_finished:
                 self._parent._finish_task()
-            if error is not None:
-                raise error
-            if self._result is not None:
-                return self._result
-            return RecordingFile._create(str(path), int(duration_ms))
+                self._parent_finished = True
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation, self._error)
+        if self._error is not None:
+            raise _copy_error(self._error)
+        assert self._result is not None
+        return self._result
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if close is None or close.status == "closed" or getattr(self, "_handle", None) is None:
+            return
+        try:
+            warnings.warn("unclosed TiRTC RecordingTask", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            result = self.stop()
+            result.delete()
+        except BaseException:
+            pass
 
 
+@final
 class Connection:
     def __init__(
         self,
@@ -179,6 +232,7 @@ class Connection:
         on_command: Callable[[int, bytes], None] | None = None,
         on_stream_message: Callable[[int, timedelta, bytes], None] | None = None,
     ) -> None:
+        _check_process()
         _callable(on_state_changed, "on_state_changed")
         _callable(on_command, "on_command")
         _callable(on_stream_message, "on_stream_message")
@@ -186,14 +240,18 @@ class Connection:
         self._on_command = on_command
         self._on_stream_message = on_stream_message
         self._state = ConnectionState.IDLE
-        self._closed = False
-        self._closing = False
         self._dependencies = 0
         self._tasks = 0
         self._lock = threading.RLock()
-        self._close_condition = threading.Condition(self._lock)
+        self._close = _CloseCoordinator(self._lock)
+        self._disconnect_finished = False
         self._dispatcher = _Dispatcher(self._handle_event)
-        code, handle = _native.conn_create(_native_sink(self._dispatcher))
+        self._handle = None
+        code, handle = _native.conn_create(
+            _native_sink(self._dispatcher),
+            on_command is not None,
+            on_stream_message is not None,
+        )
         _check_code(code)
         self._handle = handle
         _LOGGER.debug("connection created")
@@ -217,23 +275,35 @@ class Connection:
 
     @property
     def state(self) -> ConnectionState:
+        _check_process()
         with self._lock:
+            self._close.require_open()
             return self._state
 
     def _native_operation(self, function, *arguments: object) -> None:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             _check_code(function(self._handle, *arguments))
 
     def connect(self, remote_id: str, token: str) -> None:
+        _check_process()
         remote_id = _nonempty_string(remote_id, "remote_id")
         token = _nonempty_string(token, "token")
-        self._native_operation(_native.conn_connect, remote_id, token)
+        with self._lock:
+            self._close.require_open()
+            _check_code(_native.conn_connect(self._handle, remote_id, token))
+            self._state = ConnectionState.CONNECTING
+            self._disconnect_finished = False
         _LOGGER.info("connection connect requested")
 
     def disconnect(self) -> None:
-        self._native_operation(_native.conn_disconnect)
+        _check_process()
+        with self._lock:
+            self._close.require_open()
+            _check_code(_native.conn_disconnect(self._handle))
+            self._state = ConnectionState.DISCONNECTED
+            self._disconnect_finished = True
         _LOGGER.info("connection disconnect requested")
 
     def send_command(self, command_id: int, data: bytes | bytearray | memoryview) -> None:
@@ -273,26 +343,33 @@ class Connection:
     def start_recording(
         self, *, video_stream_id: int, audio_stream_id: int | None = None
     ) -> RecordingTask:
+        _check_process()
         video = _stream_id(video_stream_id, "video_stream_id")
         audio = -1 if audio_stream_id is None else _stream_id(audio_stream_id, "audio_stream_id")
         if audio == video:
             raise ValueError("audio_stream_id must differ from video_stream_id")
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            code, handle = _native.rtc_recording_start(self._handle, video, audio)
-            _check_code(code)
+            self._close.require_open()
+            task = RecordingTask._prepare(self)
             self._tasks += 1
-            return RecordingTask._create(handle, self)
+            try:
+                code, handle = _native.rtc_recording_start(self._handle, video, audio)
+                _check_code(code)
+            except BaseException:
+                self._tasks -= 1
+                task._parent_finished = True
+                raise
+            task._handle = handle
+            return task
 
     def _finish_task(self) -> None:
         with self._lock:
             self._tasks = max(0, self._tasks - 1)
 
     def _attach(self) -> object:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             self._dependencies += 1
             return self._handle
 
@@ -305,40 +382,33 @@ class Connection:
             self._dependencies = max(0, self._dependencies - 1)
 
     def close(self) -> None:
-        with self._close_condition:
+        _check_process()
+        with self._lock:
             callback = _callback_owner()
-            if (
-                callback is self
-                or getattr(callback, "_bound", None) is self
-            ):
+            if callback is self or getattr(callback, "_bound", None) is self:
                 raise _in_use_error()
-            while self._closing:
-                self._close_condition.wait()
-            if self._closed:
+            generation = self._close.begin(
+                preflight_in_use=bool(self._dependencies or self._tasks)
+            )
+            if generation is None:
                 return
-            if (
-                self._dispatcher.in_callback
-                or self._dependencies
-                or self._tasks
-            ):
-                raise _in_use_error()
-            self._closing = True
-            state = self._state
         try:
-            if state in {ConnectionState.CONNECTING, ConnectionState.CONNECTED}:
-                _check_code(_native.conn_disconnect(self._handle))
-            _check_code(_native.close(self._handle))
             self._dispatcher.close()
-        except BaseException:
-            with self._close_condition:
-                self._closing = False
-                self._close_condition.notify_all()
+            with self._lock:
+                state = self._state
+            if (
+                not self._disconnect_finished
+                and state in {ConnectionState.CONNECTING, ConnectionState.CONNECTED}
+            ):
+                _check_code(_native.conn_disconnect(self._handle))
+                self._disconnect_finished = True
+            _retry_in_use(_native.close, self._handle)
+        except BaseException as error:
+            self._close.fail(generation, error)
             raise
-        with self._close_condition:
-            self._closed = True
-            self._closing = False
+        with self._lock:
             self._state = ConnectionState.DISCONNECTED
-            self._close_condition.notify_all()
+        self._close.succeed(generation)
         _LOGGER.debug("connection closed")
 
     def __enter__(self) -> Self:
@@ -351,6 +421,9 @@ class Connection:
 class _OutputBase:
     _native_kind: str
 
+    def _native_detach(self) -> int:
+        return int(_native.output_detach_rtc(self._handle))
+
     def _initialize_output(
         self,
         on_frame,
@@ -362,7 +435,9 @@ class _OutputBase:
         decoder_preference: VideoDecoderPreference = VideoDecoderPreference.AUTO,
         buffer: OutputBufferOptions = OutputBufferOptions(),
     ) -> None:
-        _callable(on_frame, "on_frame")
+        _check_process()
+        if not callable(on_frame):
+            raise TypeError("on_frame must be callable")
         _callable(on_state_changed, "on_state_changed")
         _callable(on_error, "on_error")
         _enum(agc_level, AudioProcessingLevel, "agc_level")
@@ -382,15 +457,20 @@ class _OutputBase:
         self._on_state_changed = on_state_changed
         self._on_error = on_error
         self._state = OutputState.IDLE
-        self._closed = False
-        self._closing = False
         self._bound: Connection | None = None
         self._lock = threading.RLock()
-        self._close_condition = threading.Condition(self._lock)
-        self._dispatcher = _Dispatcher(self._handle_event)
+        self._close = _CloseCoordinator(self._lock)
+        self._native_detached = False
+        frame_capacity = 2 if self._native_kind in {"video", "encoded_video"} else 64
+        self._dispatcher = _Dispatcher(
+            self._handle_event, frame_capacity=frame_capacity
+        )
+        self._handle = None
         code, handle = _native.output_create(
             self._native_kind,
             _native_sink(self._dispatcher),
+            on_state_changed is not None,
+            on_error is not None,
             list(AudioProcessingLevel).index(agc_level),
             list(AudioProcessingLevel).index(ans_level),
             list(VideoDecoderPreference).index(decoder_preference),
@@ -411,13 +491,13 @@ class _OutputBase:
             elif kind == "error" and self._on_error is not None:
                 code = int(values[0])
                 self._on_error(_error_from_code(code, _error_name(code)))
-            elif kind == "audio_frame" and self._on_frame is not None:
+            elif kind == "audio_frame":
                 self._on_frame(self._audio_frame(values))
-            elif kind == "video_frame" and self._on_frame is not None:
+            elif kind == "video_frame":
                 self._on_frame(self._video_frame(values))
-            elif kind == "encoded_audio_frame" and self._on_frame is not None:
+            elif kind == "encoded_audio_frame":
                 self._on_frame(self._encoded_audio_frame(values))
-            elif kind == "encoded_video_frame" and self._on_frame is not None:
+            elif kind == "encoded_video_frame":
                 self._on_frame(self._encoded_video_frame(values))
 
     @staticmethod
@@ -491,12 +571,12 @@ class _OutputBase:
         )
 
     def attach(self, connection: Connection, stream_id: int) -> None:
+        _check_process()
         if not isinstance(connection, Connection):
             raise TypeError("connection must be Connection")
         stream = _stream_id(stream_id)
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             if self._bound is not None:
                 raise _in_use_error()
             connection_handle = connection._attach()
@@ -510,13 +590,16 @@ class _OutputBase:
             self._bound = connection
 
     def detach(self) -> None:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             if self._bound is None:
                 _check_code(6029)
             bound = self._bound
-            _check_code(_native.output_detach_rtc(self._handle))
+            callback = _callback_owner()
+            if callback is self or callback is bound:
+                raise _in_use_error()
+            _retry_in_use(self._native_detach)
             self._bound = None
             self._state = OutputState.IDLE
         assert bound is not None
@@ -524,48 +607,61 @@ class _OutputBase:
 
     @property
     def state(self) -> OutputState:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             code, state = _native.output_state(self._handle)
             _check_code(code)
             self._state = _OUTPUT_STATES[int(state)]
             return self._state
 
     def close(self) -> None:
-        with self._close_condition:
+        _check_process()
+        self._close_output()
+
+    def _close_output(self) -> None:
+        with self._lock:
             callback = _callback_owner()
-            if (
-                callback is self
-                or (self._bound is not None and callback is self._bound)
-            ):
+            if callback is self or (self._bound is not None and callback is self._bound):
                 raise _in_use_error()
-            while self._closing:
-                self._close_condition.wait()
-            if self._closed:
+            generation = self._close.begin()
+            if generation is None:
                 return
-            if self._dispatcher.in_callback:
-                raise _in_use_error()
-            self._closing = True
             bound = self._bound
         try:
-            if bound is not None:
-                _check_code(_native.output_detach_rtc(self._handle))
-                with self._lock:
-                    self._bound = None
-                    self._state = OutputState.IDLE
-                bound._detach()
-            _check_code(_native.close(self._handle))
             self._dispatcher.close()
-        except BaseException:
-            with self._close_condition:
-                self._closing = False
-                self._close_condition.notify_all()
+            if bound is not None and not self._native_detached:
+                _retry_in_use(self._native_detach)
+                self._native_detached = True
+            _retry_in_use(_native.close, self._handle)
+        except BaseException as error:
+            self._close.fail(generation, error)
             raise
-        with self._close_condition:
-            self._closed = True
-            self._closing = False
-            self._close_condition.notify_all()
+        with self._lock:
+            self._bound = None
+            self._state = OutputState.IDLE
+        if bound is not None:
+            bound._detach()
+        self._close.succeed(generation)
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if (
+            close is None
+            or close.status == "closed"
+            or getattr(self, "_handle", None) is None
+        ):
+            return
+        try:
+            warnings.warn(
+                f"unclosed TiRTC {type(self).__name__}", ResourceWarning, stacklevel=2
+            )
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            self._dispatcher.discard()
+            self._close_output()
+        except BaseException:
+            pass
 
     def __enter__(self) -> Self:
         return self
@@ -574,12 +670,13 @@ class _OutputBase:
         self.close()
 
 
+@final
 class AudioOutput(_OutputBase):
     _native_kind = "audio"
 
     def __init__(
         self,
-        on_frame: Callable[[AudioFrame], None] | None = None,
+        on_frame: Callable[[AudioFrame], None],
         *,
         on_state_changed: Callable[[OutputState], None] | None = None,
         on_error: Callable[[TiRTCError], None] | None = None,
@@ -597,12 +694,13 @@ class AudioOutput(_OutputBase):
         )
 
 
+@final
 class VideoOutput(_OutputBase):
     _native_kind = "video"
 
     def __init__(
         self,
-        on_frame: Callable[[VideoFrame], None] | None = None,
+        on_frame: Callable[[VideoFrame], None],
         *,
         on_state_changed: Callable[[OutputState], None] | None = None,
         on_error: Callable[[TiRTCError], None] | None = None,
@@ -618,20 +716,21 @@ class VideoOutput(_OutputBase):
         )
 
     def take_snapshot(self) -> SnapshotFile:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             code, path = _native.output_snapshot(self._handle)
         _check_code(code)
         return SnapshotFile._create(str(path))
 
 
+@final
 class EncodedAudioOutput(_OutputBase):
     _native_kind = "encoded_audio"
 
     def __init__(
         self,
-        on_frame: Callable[[EncodedAudioFrame], None] | None = None,
+        on_frame: Callable[[EncodedAudioFrame], None],
         *,
         on_state_changed: Callable[[OutputState], None] | None = None,
         on_error: Callable[[TiRTCError], None] | None = None,
@@ -639,12 +738,13 @@ class EncodedAudioOutput(_OutputBase):
         self._initialize_output(on_frame, on_state_changed, on_error)
 
 
+@final
 class EncodedVideoOutput(_OutputBase):
     _native_kind = "encoded_video"
 
     def __init__(
         self,
-        on_frame: Callable[[EncodedVideoFrame], None] | None = None,
+        on_frame: Callable[[EncodedVideoFrame], None],
         *,
         on_state_changed: Callable[[OutputState], None] | None = None,
         on_error: Callable[[TiRTCError], None] | None = None,

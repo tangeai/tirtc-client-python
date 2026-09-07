@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 from datetime import timedelta
+import math
 import os
 from pathlib import Path
 import shutil
@@ -15,7 +16,6 @@ import tirtc
 
 MAXIMUM_MEDIA_FILE_SIZE = 512 << 20
 MINIMUM_RECORDING_SECONDS = 3.0
-RESOURCE_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 class Signals:
@@ -47,7 +47,7 @@ class Signals:
                 self._counts.get(name, 0) <= baseline.get(name, 0) for name in names
             ):
                 if self._failure is not None:
-                    raise RuntimeError("media callback failed") from self._failure
+                    raise self._failure
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     missing = [
@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("stream IDs must be between 0 and 15")
     if args.audio_stream_id == args.video_stream_id:
         parser.error("audio and video stream IDs must differ")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
     return args
 
 
@@ -98,18 +98,6 @@ def save_temporary_media(source: Path, destination: Path, signature: bytes, offs
     shutil.copyfile(source, destination)
 
 
-def close_when_idle(resource: object) -> None:
-    deadline = time.monotonic() + RESOURCE_CLOSE_TIMEOUT_SECONDS
-    while True:
-        try:
-            resource.close()
-            return
-        except tirtc.InUseError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.01)
-
-
 def run() -> None:
     args = parse_args()
     app_id = os.environ.get("TIRTC_APP_ID", "")
@@ -120,7 +108,6 @@ def run() -> None:
     deadline = time.monotonic() + args.timeout
     signals = Signals()
     frame_names = ("audio", "video", "encoded_audio", "encoded_video")
-    connected = threading.Event()
     command_received = threading.Event()
     message_received = threading.Event()
 
@@ -128,7 +115,7 @@ def run() -> None:
         if error is not None:
             signals.fail(error)
         if state is tirtc.ConnectionState.CONNECTED:
-            connected.set()
+            signals.notify("connected")
 
     def on_output_error(error: tirtc.TiRTCError) -> None:
         signals.fail(error)
@@ -141,20 +128,20 @@ def run() -> None:
                 on_command=lambda command_id, data: command_received.set(),
                 on_stream_message=lambda stream_id, timestamp, data: message_received.set(),
             )
-            stack.callback(close_when_idle, connection)
+            stack.callback(connection.close)
             audio = tirtc.AudioOutput(
                 lambda frame: signals.notify("audio"), on_error=on_output_error
             )
-            stack.callback(close_when_idle, audio)
+            stack.callback(audio.close)
             video = tirtc.VideoOutput(
                 lambda frame: signals.notify("video"), on_error=on_output_error
             )
-            stack.callback(close_when_idle, video)
+            stack.callback(video.close)
             encoded_audio = tirtc.EncodedAudioOutput(
                 lambda frame: signals.notify("encoded_audio"),
                 on_error=on_output_error,
             )
-            stack.callback(close_when_idle, encoded_audio)
+            stack.callback(encoded_audio.close)
 
             def on_encoded_video(frame: tirtc.EncodedVideoFrame) -> None:
                 signals.notify("encoded_video")
@@ -164,14 +151,13 @@ def run() -> None:
             encoded_video = tirtc.EncodedVideoOutput(
                 on_encoded_video, on_error=on_output_error
             )
-            stack.callback(close_when_idle, encoded_video)
+            stack.callback(encoded_video.close)
             audio.attach(connection, args.audio_stream_id)
             video.attach(connection, args.video_stream_id)
             encoded_audio.attach(connection, args.audio_stream_id)
             encoded_video.attach(connection, args.video_stream_id)
             connection.connect(args.remote_id, token)
-            if not connected.wait(max(0, deadline - time.monotonic())):
-                raise TimeoutError("timed out waiting for RTC connection")
+            signals.wait_after(("connected",), {}, deadline)
             connection.subscribe_audio(args.audio_stream_id)
             connection.subscribe_video(args.video_stream_id)
 
