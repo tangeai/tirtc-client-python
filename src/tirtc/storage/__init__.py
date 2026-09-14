@@ -1,27 +1,36 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from collections.abc import Callable
 from datetime import date, datetime
-from enum import StrEnum
-import os
+from enum import IntEnum, StrEnum
+import sys
 import threading
-import time
-from typing import Self
-import weakref
+from typing import Any, Self, final
+import warnings
 from zoneinfo import ZoneInfo
 
 import tirtc
 from tirtc import _native
+from tirtc import _build_identity
 from tirtc._core import _OutputBase
-from tirtc._dispatch import _Dispatcher, _active_callback, _callback_owner, _native_sink
+from tirtc._dispatch import _Dispatcher, _active_callback, _callback_owner, _native_sink, _native_task_sink
 from tirtc._errors import (
-    _closed_error,
     _error_from_code,
     _in_use_error,
     _timeout_error,
 )
-from tirtc._runtime import _error_name, _initialize, _shutdown
+from tirtc._lifecycle import _CloseCoordinator, _copy_error
+from tirtc._runtime import (
+    ClientOptions,
+    _RuntimeLease,
+    _acquire_storage,
+    _check_process,
+    _error_name,
+    _process_is_current,
+    _upload_logs,
+)
 from tirtc._util import (
     _aware_datetime,
     _callable,
@@ -29,24 +38,12 @@ from tirtc._util import (
     _check_code,
     _datetime_from_ms,
     _datetime_ms,
-    _integer,
     _nonempty_string,
+    _retry_in_use,
+    _retry_in_use_result,
+    _timeout,
 )
 from tirtc._values import OutputState
-
-
-def initialize(
-    app_id: str,
-    cache_dir: str | os.PathLike[str],
-    *,
-    endpoint: str | None = None,
-    console_log_enabled: bool = False,
-) -> None:
-    _initialize("storage", app_id, cache_dir, endpoint, console_log_enabled)
-
-
-def shutdown() -> None:
-    _shutdown("storage")
 
 
 class ReplaySpeed(StrEnum):
@@ -83,49 +80,295 @@ class RecordingRange:
     end_time: datetime
 
 
-def _timeout(value: float | None) -> float | None:
-    if value is None:
-        return None
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise TypeError("timeout must be float or None")
-    value = float(value)
-    if value <= 0:
-        raise ValueError("timeout must be positive")
-    return value
+class RecordingTrackKind(IntEnum):
+    VIDEO = 1
+    AUDIO = 2
+
+
+class RecordingGapReason(IntEnum):
+    UNKNOWN = 0
+    NOT_FOUND = 1
+    DOWNLOAD_FAILED = 2
+    INTEGRITY_FAILED = 3
+    MEDIA_UNREADABLE = 4
+    NO_KEY_FRAME = 5
+    NO_RECORDING = 6
+    DECRYPTION_FAILED = 7
+    UNSUPPORTED_MEDIA = 8
+    TRACK_UNAVAILABLE = 9
+
+
+class ExportTermination(IntEnum):
+    EXHAUSTED = 0
+    INTERRUPTED = 1
+    CANCELLED = 2
+    FAILED = 3
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingTrack:
+    kind: RecordingTrackKind
+    channel_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingGap:
+    range: RecordingRange
+    tracks: tuple[RecordingTrack, ...]
+    reasons: tuple[RecordingGapReason, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExportProgress:
+    fraction: float
+    covered_duration_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExportSegment:
+    source_range: RecordingRange
+    output_start_ms: int
+    output_end_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExportReport:
+    requested_range: RecordingRange
+    covered_duration_ms: int
+    segments: tuple[ExportSegment, ...]
+    gaps: tuple[RecordingGap, ...]
+    unprocessed_ranges: tuple[RecordingRange, ...]
+    complete: bool
+    termination: ExportTermination
+    cause: tirtc.TiRTCError | None
+
+
+def _recording_gap_from_native(value: Any) -> RecordingGap:
+    start, end, tracks, reasons = value
+    return RecordingGap(
+        RecordingRange(_datetime_from_ms(int(start)), _datetime_from_ms(int(end))),
+        tuple(RecordingTrack(RecordingTrackKind(int(kind)), int(channel)) for kind, channel in tracks),
+        tuple(RecordingGapReason(int(reason)) for reason in reasons),
+    )
+
+
+def _export_report_from_native(value: Any) -> ExportReport:
+    start, end, covered, complete, termination, cause, segments, gaps, unprocessed = value
+    cause_code = int(cause)
+    return ExportReport(
+        requested_range=RecordingRange(_datetime_from_ms(int(start)), _datetime_from_ms(int(end))),
+        covered_duration_ms=int(covered),
+        segments=tuple(
+            ExportSegment(
+                RecordingRange(_datetime_from_ms(int(item[0])), _datetime_from_ms(int(item[1]))),
+                int(item[2]),
+                int(item[3]),
+            )
+            for item in segments
+        ),
+        gaps=tuple(_recording_gap_from_native(item) for item in gaps),
+        unprocessed_ranges=tuple(
+            RecordingRange(_datetime_from_ms(int(item[0])), _datetime_from_ms(int(item[1])))
+            for item in unprocessed
+        ),
+        complete=bool(complete),
+        termination=ExportTermination(int(termination)),
+        cause=_error_from_code(cause_code, _error_name(cause_code)) if cause_code else None,
+    )
 
 
 def _destroy_with_barrier(handle: object) -> None:
-    deadline = time.monotonic() + 2.0
-    delay = 0.001
-    while True:
-        code = int(_native.close(handle))
-        if code != 6026:
-            _check_code(code)
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _check_code(code)
-        time.sleep(min(delay, remaining))
-        delay = min(delay * 2, 0.02)
+    _retry_in_use(_native.close, handle)
 
 
-class CloudStorage:
-    def __init__(self, token: str) -> None:
-        token = _nonempty_string(token, "token")
-        code, handle = _native.storage_create(token)
-        _check_code(code)
-        self._handle = handle
-        self._closed = False
-        self._list_active = False
-        self._dependencies = 0
-        self._tasks = 0
+def _callback_descends_from(owner: object | None, target: object) -> bool:
+    pending = [owner]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if current is target:
+            return True
+        seen.add(id(current))
+        pending.extend(
+            getattr(current, name, None)
+            for name in ("_client", "_parent", "_replay", "_bound")
+        )
+    return False
+
+
+@final
+class Client:
+    def __init__(
+        self,
+        options: ClientOptions,
+        *,
+        access_key_id: str | None = None,
+        access_key_secret: str | None = None,
+    ) -> None:
+        if (access_key_id is None) != (access_key_secret is None):
+            raise ValueError("access_key_id and access_key_secret must be provided together")
+        if access_key_id is None:
+            lease = _acquire_storage(options, "external_token")
+        else:
+            lease = _acquire_storage(
+                options,
+                "access_key",
+                access_key_id=access_key_id,
+                access_key_secret=access_key_secret,
+            )
+        self._lease = lease
         self._lock = threading.RLock()
+        self._close = _CloseCoordinator(self._lock)
+        self._clouds: set[CloudStorage] = set()
+        _build_identity.log("cloud_storage", _native)
+
+    @property
+    def _mode(self) -> str:
+        return self._lease.mode
+
+    def _open(self, mode: str, value: str) -> CloudStorage:
+        _check_process()
+        with self._lock:
+            self._close.require_open()
+            if self._mode != mode:
+                raise _in_use_error()
+            cloud = CloudStorage._prepare(self)
+            if mode == "access_key":
+                code, handle = _native.storage_client_open_device(
+                    self._lease.handle, value
+                )
+            else:
+                code, handle = _native.storage_create(value)
+            _check_code(code)
+            cloud._handle = handle
+            self._clouds.add(cloud)
+            return cloud
+
+    def open_device(self, device_id: str) -> CloudStorage:
+        device = _nonempty_string(device_id, "device_id")
+        return self._open("access_key", device)
+
+    def open_with_token(self, token: str) -> CloudStorage:
+        access_token = _nonempty_string(token, "token")
+        return self._open("external_token", access_token)
+
+    def _finish_cloud(self, cloud: CloudStorage) -> None:
+        with self._lock:
+            self._clouds.discard(cloud)
+
+    def upload_logs(self) -> str:
+        _check_process()
+        with self._lock:
+            self._close.require_open()
+            return _upload_logs(self._lease)
+
+    def close(self) -> None:
+        _check_process()
+        with self._lock:
+            if _callback_descends_from(_callback_owner(), self):
+                raise _in_use_error()
+            generation = self._close.begin()
+            if generation is None:
+                return
+            clouds = tuple(self._clouds)
+        try:
+            for cloud in clouds:
+                cloud._close_from_client()
+            self._lease.close()
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation)
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if close is None or close.status == "closed":
+            return
+        try:
+            warnings.warn("unclosed TiRTC Cloud Client", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            self.close()
+        except BaseException:
+            pass
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+class _ListRequest:
+    def __init__(self) -> None:
+        self.handle: object | None = None
+        self.completed = threading.Event()
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self._lock = threading.Lock()
+        self._cancel_started = False
+        self._cancel_finished = threading.Event()
+
+    def on_completed(self, event: str) -> None:
+        if event == "completed":
+            self.completed.set()
+
+    def set_handle(self, handle: object | None) -> None:
+        self.handle = handle
+        self.started.set()
+
+    def cancel(self) -> None:
+        self.started.wait()
+        with self._lock:
+            if self.handle is None or self.completed.is_set():
+                return
+            if self._cancel_started:
+                perform = False
+            else:
+                self._cancel_started = True
+                perform = True
+        if not perform:
+            self._cancel_finished.wait()
+            return
+        try:
+            _check_code(_native.request_cancel(self.handle))
+        finally:
+            self._cancel_finished.set()
+
+    def cancel_and_wait(self) -> None:
+        self.cancel()
+        while not self.completed.is_set() and not self.finished.wait(0.01):
+            pass
+        self.finished.wait()
+
+
+@final
+class CloudStorage:
+    def __init__(self) -> None:
+        raise TypeError("CloudStorage values are created by Client open methods")
+
+    @classmethod
+    def _prepare(cls, client: Client) -> CloudStorage:
+        self = object.__new__(cls)
+        self._handle = None
+        self._client = client
+        self._mode = client._mode
+        self._requests: set[_ListRequest] = set()
+        self._replays: set[Replay] = set()
+        self._exports: set[ExportTask] = set()
+        self._lock = threading.RLock()
+        self._close = _CloseCoordinator(self._lock)
+        return self
 
     def update_token(self, token: str) -> None:
+        _check_process()
         token = _nonempty_string(token, "token")
         with self._lock:
-            if self._closed:
-                raise _closed_error()
+            self._close.require_open()
+            if self._mode != "external_token":
+                raise _in_use_error()
             _check_code(_native.storage_update_token(self._handle, token))
 
     def _list(
@@ -136,31 +379,30 @@ class CloudStorage:
         timezone: str | None,
         timeout: float | None,
     ) -> list[tuple[object, ...]]:
+        _check_process()
         deadline = _timeout(timeout)
-        completed = threading.Event()
-
-        def on_completed(event: str) -> None:
-            if event == "completed":
-                completed.set()
-
+        state = _ListRequest()
         with self._lock:
-            if self._closed:
-                raise _closed_error()
-            if self._list_active:
+            self._close.require_open()
+            if self._requests:
                 raise _in_use_error()
-            self._list_active = True
+            self._requests.add(state)
             handle = self._handle
-        request = None
         timed_out = False
         try:
-            code, request = _native.storage_list_start(
-                handle, kind, first, second, timezone, on_completed
-            )
-            _check_code(code)
-            if not completed.wait(deadline):
+            try:
+                code, request = _native.storage_list_start(
+                    handle, kind, first, second, timezone, state.on_completed
+                )
+                _check_code(code)
+            except BaseException:
+                state.set_handle(None)
+                raise
+            state.set_handle(request)
+            if not state.completed.wait(deadline):
                 timed_out = True
-                _check_code(_native.request_cancel(request))
-                completed.wait()
+                state.cancel()
+                state.completed.wait()
             code, values = _native.request_result(request)
             if timed_out:
                 raise _timeout_error()
@@ -168,11 +410,12 @@ class CloudStorage:
             return list(values)
         finally:
             try:
-                if request is not None:
-                    _destroy_with_barrier(request)
+                if state.handle is not None:
+                    _destroy_with_barrier(state.handle)
             finally:
                 with self._lock:
-                    self._list_active = False
+                    self._requests.discard(state)
+                state.finished.set()
 
     def list_recording_days(
         self,
@@ -182,6 +425,7 @@ class CloudStorage:
         timezone: str | ZoneInfo = "Asia/Shanghai",
         timeout: float | None = None,
     ) -> list[RecordingDay]:
+        _check_process()
         if not isinstance(start_date, date) or isinstance(start_date, datetime):
             raise TypeError("start_date must be datetime.date")
         if not isinstance(end_date, date) or isinstance(end_date, datetime):
@@ -212,6 +456,7 @@ class CloudStorage:
         *,
         timeout: float | None = None,
     ) -> list[RecordingRange]:
+        _check_process()
         start = _datetime_ms(start_time, "start_time")
         end = _datetime_ms(end_time, "end_time")
         if start >= end:
@@ -228,21 +473,31 @@ class CloudStorage:
         on_time_changed: Callable[[datetime], None] | None = None,
         on_completed: Callable[[], None] | None = None,
         on_error: Callable[[tirtc.TiRTCError], None] | None = None,
+        on_recording_gap: Callable[[RecordingGap], None] | None = None,
     ) -> Replay:
+        _check_process()
         _callable(on_time_changed, "on_time_changed")
         _callable(on_completed, "on_completed")
         _callable(on_error, "on_error")
+        _callable(on_recording_gap, "on_recording_gap")
         with self._lock:
-            if self._closed:
-                raise _closed_error()
+            self._close.require_open()
             replay = Replay.__new__(Replay)
-            replay._prepare(self, on_time_changed, on_completed, on_error)
-            code, handle = _native.replay_create(
-                self._handle, _native_sink(replay._dispatcher)
-            )
-            _check_code(code)
+            replay._prepare(self, on_time_changed, on_completed, on_error, on_recording_gap)
+            self._replays.add(replay)
+            try:
+                code, handle = _native.replay_create(
+                    self._handle,
+                    _native_task_sink(replay._dispatcher),
+                    on_time_changed is not None,
+                    on_recording_gap is not None,
+                )
+                _check_code(code)
+            except BaseException:
+                self._replays.discard(replay)
+                replay._parent_finished = True
+                raise
             replay._handle = handle
-            self._dependencies += 1
             return replay
 
     def export_recording(
@@ -252,49 +507,96 @@ class CloudStorage:
         *,
         video_channel_id: int,
         audio_channel_id: int | None = None,
+        on_progress: Callable[[ExportProgress], None] | None = None,
+        on_recording_gap: Callable[[RecordingGap], None] | None = None,
     ) -> ExportTask:
+        _check_process()
         start = _datetime_ms(start_time, "start_time")
         end = _datetime_ms(end_time, "end_time")
         if start >= end:
             raise ValueError("start_time must be before end_time")
         video = _channel_id(video_channel_id, "video_channel_id")
         audio = -1 if audio_channel_id is None else _channel_id(audio_channel_id, "audio_channel_id")
-        if audio == video:
-            raise ValueError("audio_channel_id must differ from video_channel_id")
+        _callable(on_progress, "on_progress")
+        _callable(on_recording_gap, "on_recording_gap")
         with self._lock:
-            if self._closed:
-                raise _closed_error()
+            self._close.require_open()
             task = ExportTask.__new__(ExportTask)
-            task._prepare(self)
-            code, handle = _native.export_create(
-                self._handle,
-                start,
-                end,
-                video,
-                audio,
-                task._native_sink(),
-            )
-            _check_code(code)
+            task._prepare(self, on_progress, on_recording_gap)
+            self._exports.add(task)
+            try:
+                code, handle = _native.export_create(
+                    self._handle,
+                    start,
+                    end,
+                    video,
+                    audio,
+                    task._native_sink(),
+                    on_progress is not None,
+                    on_recording_gap is not None,
+                )
+                _check_code(code)
+            except BaseException:
+                self._exports.discard(task)
+                task._parent_finished = True
+                raise
             task._handle = handle
-            self._tasks += 1
             return task
 
-    def _finish_dependency(self) -> None:
+    def _finish_replay(self, replay: Replay) -> None:
         with self._lock:
-            self._dependencies = max(0, self._dependencies - 1)
+            self._replays.discard(replay)
 
-    def _finish_task(self) -> None:
+    def _finish_export(self, task: ExportTask) -> None:
         with self._lock:
-            self._tasks = max(0, self._tasks - 1)
+            self._exports.discard(task)
 
     def close(self) -> None:
+        self._close_cloud()
+
+    def _close_from_client(self) -> None:
+        self._close_cloud()
+
+    def _close_cloud(self) -> None:
+        _check_process()
         with self._lock:
-            if self._closed:
-                return
-            if self._list_active or self._dependencies or self._tasks:
+            if _callback_descends_from(_callback_owner(), self):
                 raise _in_use_error()
-            _check_code(_native.close(self._handle))
-            self._closed = True
+            generation = self._close.begin()
+            if generation is None:
+                return
+            requests = tuple(self._requests)
+            replays = tuple(self._replays)
+            exports = tuple(self._exports)
+        try:
+            for request in requests:
+                request.cancel_and_wait()
+            for replay in replays:
+                replay._close_from_parent()
+            for task in exports:
+                task._close_from_parent()
+            _retry_in_use(_native.close, self._handle)
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation)
+        self._client._finish_cloud(self)
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if (
+            close is None
+            or close.status == "closed"
+            or getattr(self, "_handle", None) is None
+        ):
+            return
+        try:
+            warnings.warn("unclosed TiRTC CloudStorage", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            self._close_cloud()
+        except BaseException:
+            pass
 
     def __enter__(self) -> Self:
         return self
@@ -303,24 +605,34 @@ class CloudStorage:
         self.close()
 
 
+@final
 class Replay:
     def __init__(self) -> None:
         raise TypeError("Replay values are created by CloudStorage.create_replay()")
 
-    def _prepare(self, parent: CloudStorage, on_time_changed, on_completed, on_error) -> None:
+    def _prepare(
+        self,
+        parent: CloudStorage,
+        on_time_changed,
+        on_completed,
+        on_error,
+        on_recording_gap,
+    ) -> None:
+        self._handle = None
         self._parent = parent
         self._on_time_changed = on_time_changed
         self._on_completed = on_completed
         self._on_error = on_error
+        self._on_recording_gap = on_recording_gap
         self._lock = threading.RLock()
         self._dispatcher = _Dispatcher(self._handle_event)
         self._speed = ReplaySpeed.X1
-        self._active = False
-        self._dependencies = 0
-        self._tasks = 0
-        self._closed = False
-        self._closing = False
-        self._close_condition = threading.Condition(self._lock)
+        self._outputs: set[_StorageOutputBase] = set()
+        self._tasks: set[RecordingTask] = set()
+        self._close = _CloseCoordinator(self._lock)
+        self._native_stopped = False
+        self._parent_finished = False
+        self._playback_range: tuple[int, int] | None = None
 
     def _handle_event(self, kind: str, *values: object) -> None:
         with _active_callback(self):
@@ -328,22 +640,40 @@ class Replay:
                 if self._on_time_changed is not None:
                     self._on_time_changed(_datetime_from_ms(int(values[0])))
             elif kind == "completed":
-                with self._lock:
-                    self._active = False
                 if self._on_completed is not None:
                     self._on_completed()
             elif kind == "error":
-                with self._lock:
-                    self._active = False
                 if self._on_error is not None:
                     code = int(values[0])
                     self._on_error(_error_from_code(code, _error_name(code)))
+            elif kind == "gap" and self._on_recording_gap is not None:
+                self._on_recording_gap(_recording_gap_from_native(values[0]))
+
+    def _in_related_callback(self) -> bool:
+        callback = _callback_owner()
+        return callback is self or getattr(callback, "_bound", None) is self
+
+    @contextmanager
+    def _operation_lock(self):
+        if not self._lock.acquire(blocking=not self._in_related_callback()):
+            raise _in_use_error()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _reject_blocking_callback(self) -> None:
+        if self._in_related_callback():
+            raise _in_use_error()
 
     def _operation(self, function, *arguments: object) -> None:
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            _check_code(function(self._handle, *arguments))
+        _check_process()
+        with self._operation_lock():
+            self._close.require_open()
+            if self._in_related_callback():
+                _check_code(function(self._handle, *arguments))
+            else:
+                _retry_in_use(function, self._handle, *arguments)
 
     def play(
         self,
@@ -352,22 +682,20 @@ class Replay:
         *,
         initial_time: datetime | None = None,
     ) -> None:
+        _check_process()
+        self._reject_blocking_callback()
         start = _datetime_ms(start_time, "start_time")
         end = _datetime_ms(end_time, "end_time")
         if start >= end:
             raise ValueError("start_time must be before end_time")
         initial = start if initial_time is None else _datetime_ms(initial_time, "initial_time")
-        if initial < start or initial > end:
+        if initial < start or initial >= end:
             raise ValueError("initial_time must be inside the playback range")
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            self._active = True
-            try:
-                _check_code(_native.replay_play(self._handle, start, end, initial))
-            except BaseException:
-                self._active = False
-                raise
+        with self._operation_lock():
+            self._close.require_open()
+            _check_code(_native.replay_play(self._handle, start, end, initial))
+            self._playback_range = (start, end)
+            self._native_stopped = False
 
     def pause(self) -> None:
         self._operation(_native.replay_pause)
@@ -376,24 +704,40 @@ class Replay:
         self._operation(_native.replay_resume)
 
     def seek(self, target: datetime) -> None:
-        self._operation(_native.replay_seek, _datetime_ms(target, "target"))
+        _check_process()
+        self._reject_blocking_callback()
+        target_ms = _datetime_ms(target, "target")
+        with self._operation_lock():
+            self._close.require_open()
+            if self._playback_range is not None:
+                start, end = self._playback_range
+                if target_ms < start or target_ms >= end:
+                    raise ValueError("target must be inside the playback range")
+            _retry_in_use(_native.replay_seek, self._handle, target_ms)
 
     def set_speed(self, speed: ReplaySpeed) -> None:
+        _check_process()
         if not isinstance(speed, ReplaySpeed):
             raise TypeError("speed must be ReplaySpeed")
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            _check_code(
-                _native.replay_set_speed(self._handle, _REPLAY_SPEED_TO_NATIVE[speed])
-            )
+        with self._operation_lock():
+            self._close.require_open()
+            if self._in_related_callback():
+                _check_code(
+                    _native.replay_set_speed(self._handle, _REPLAY_SPEED_TO_NATIVE[speed])
+                )
+            else:
+                _retry_in_use(
+                    _native.replay_set_speed,
+                    self._handle,
+                    _REPLAY_SPEED_TO_NATIVE[speed],
+                )
             self._speed = speed
 
     @property
     def speed(self) -> ReplaySpeed:
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+        _check_process()
+        with self._operation_lock():
+            self._close.require_open()
             code, value = _native.replay_get_speed(self._handle)
             _check_code(code)
             self._speed = _REPLAY_SPEED_FROM_NATIVE[int(value)]
@@ -401,91 +745,110 @@ class Replay:
 
     @property
     def current_time(self) -> datetime | None:
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+        _check_process()
+        with self._operation_lock():
+            self._close.require_open()
             code, present, value = _native.replay_current_time(self._handle)
         _check_code(code)
         return _datetime_from_ms(int(value)) if present else None
 
     def stop(self) -> None:
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            _check_code(_native.replay_stop(self._handle))
-            self._active = False
+        _check_process()
+        self._reject_blocking_callback()
+        with self._operation_lock():
+            self._close.require_open()
+            _retry_in_use(_native.replay_stop, self._handle)
+            self._native_stopped = True
 
     def start_recording(
         self, *, video_channel_id: int, audio_channel_id: int | None = None
     ) -> RecordingTask:
+        _check_process()
         video = _channel_id(video_channel_id, "video_channel_id")
         audio = -1 if audio_channel_id is None else _channel_id(audio_channel_id, "audio_channel_id")
-        if audio == video:
-            raise ValueError("audio_channel_id must differ from video_channel_id")
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            code, handle = _native.storage_recording_start(self._handle, video, audio)
-            _check_code(code)
-            self._tasks += 1
-            return RecordingTask._create(handle, self)
+        with self._operation_lock():
+            self._close.require_open()
+            task = RecordingTask._prepare(self)
+            self._tasks.add(task)
+            try:
+                code, handle = _native.storage_recording_start(self._handle, video, audio)
+                _check_code(code)
+            except BaseException:
+                self._tasks.discard(task)
+                task._parent_finished = True
+                raise
+            task._handle = handle
+            return task
 
-    def _attach(self) -> object:
-        with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
-            self._dependencies += 1
+    def _attach(self, output: _StorageOutputBase) -> object:
+        _check_process()
+        with self._operation_lock():
+            self._close.require_open()
+            self._outputs.add(output)
             return self._handle
 
-    def _attach_failed(self) -> None:
+    def _attach_failed(self, output: _StorageOutputBase) -> None:
         with self._lock:
-            self._dependencies -= 1
+            self._outputs.discard(output)
 
-    def _detach(self) -> None:
+    def _detach(self, output: _StorageOutputBase) -> None:
         with self._lock:
-            self._dependencies = max(0, self._dependencies - 1)
+            self._outputs.discard(output)
 
-    def _finish_task(self) -> None:
+    def _finish_task(self, task: RecordingTask) -> None:
         with self._lock:
-            self._tasks = max(0, self._tasks - 1)
+            self._tasks.discard(task)
 
     def close(self) -> None:
-        with self._close_condition:
-            callback = _callback_owner()
-            if (
-                callback is self
-                or getattr(callback, "_bound", None) is self
-            ):
-                raise _in_use_error()
-            while self._closing:
-                self._close_condition.wait()
-            if self._closed:
+        _check_process()
+        self._close_replay()
+
+    def _close_from_parent(self) -> None:
+        self._close_replay()
+
+    def _close_replay(self) -> None:
+        self._reject_blocking_callback()
+        with self._lock:
+            generation = self._close.begin()
+            if generation is None:
                 return
-            if (
-                self._dispatcher.in_callback
-                or self._dependencies
-                or self._tasks
-            ):
-                raise _in_use_error()
-            self._closing = True
-            active = self._active
+            outputs = tuple(self._outputs)
+            tasks = tuple(self._tasks)
         try:
-            if active:
-                _check_code(_native.replay_stop(self._handle))
-                with self._lock:
-                    self._active = False
-            _check_code(_native.close(self._handle))
+            for task in tasks:
+                result = task.stop()
+                result.delete()
+            for output in outputs:
+                output._detach_from_parent(self)
+            if not self._native_stopped:
+                _retry_in_use(_native.replay_stop, self._handle)
+                self._native_stopped = True
             self._dispatcher.close()
-        except BaseException:
-            with self._close_condition:
-                self._closing = False
-                self._close_condition.notify_all()
+            _retry_in_use(_native.close, self._handle)
+            if not self._parent_finished:
+                self._parent._finish_replay(self)
+                self._parent_finished = True
+        except BaseException as error:
+            self._close.fail(generation, error)
             raise
-        with self._close_condition:
-            self._closed = True
-            self._closing = False
-            self._close_condition.notify_all()
-        self._parent._finish_dependency()
+        self._close.succeed(generation)
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if (
+            close is None
+            or close.status == "closed"
+            or getattr(self, "_handle", None) is None
+        ):
+            return
+        try:
+            warnings.warn("unclosed TiRTC Replay", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            self._dispatcher.discard()
+            self._close_replay()
+        except BaseException:
+            pass
 
     def __enter__(self) -> Self:
         return self
@@ -494,121 +857,152 @@ class Replay:
         self.close()
 
 
+@final
 class RecordingTask:
     def __init__(self) -> None:
         raise TypeError("RecordingTask values are created by Replay.start_recording()")
 
     @classmethod
-    def _create(cls, handle: object, replay: Replay) -> RecordingTask:
+    def _prepare(cls, replay: Replay) -> RecordingTask:
         self = object.__new__(cls)
-        self._handle = handle
+        self._handle = None
         self._replay = replay
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._close = _CloseCoordinator(self._lock)
         self._result: tirtc.RecordingFile | None = None
         self._error: BaseException | None = None
-        self._finished = False
+        self._stopped = False
+        self._parent_finished = False
+        return self
+
+    @classmethod
+    def _create(cls, handle: object, replay: Replay) -> RecordingTask:
+        self = cls._prepare(replay)
+        self._handle = handle
         return self
 
     def stop(self) -> tirtc.RecordingFile:
+        _check_process()
+        if _callback_owner() is self._replay:
+            raise _in_use_error()
         with self._lock:
-            if self._finished:
+            generation = self._close.begin()
+            if generation is None:
                 if self._error is not None:
-                    raise self._error
+                    raise _copy_error(self._error)
                 assert self._result is not None
                 return self._result
-            code, path, duration_ms, destroyed = _native.recording_stop(self._handle)
-            error = _error_from_code(code, _error_name(code)) if code else None
-            if destroyed:
-                self._finished = True
+        try:
+            if not self._stopped:
+                code, path, duration_ms = _retry_in_use_result(
+                    _native.recording_stop, self._handle
+                )
+                self._error = _error_from_code(code, _error_name(code)) if code else None
                 self._result = (
                     tirtc.RecordingFile._create(str(path), int(duration_ms)) if not code else None
                 )
-                self._error = error
-                self._replay._finish_task()
-            if error is not None:
-                raise error
-            if self._result is not None:
-                return self._result
-            return tirtc.RecordingFile._create(str(path), int(duration_ms))
+                self._stopped = True
+            _retry_in_use(_native.close, self._handle)
+            if not self._parent_finished:
+                self._replay._finish_task(self)
+                self._parent_finished = True
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation, self._error)
+        if self._error is not None:
+            raise _copy_error(self._error)
+        assert self._result is not None
+        return self._result
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if close is None or close.status == "closed" or getattr(self, "_handle", None) is None:
+            return
+        try:
+            warnings.warn("unclosed TiRTC RecordingTask", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            result = self.stop()
+            result.delete()
+        except BaseException:
+            pass
 
 
 class _StorageOutputBase(_OutputBase):
     _bound: Replay | None
 
+    def _native_detach(self) -> int:
+        return int(_native.output_detach_storage(self._handle))
+
     def attach(self, replay: Replay, channel_id: int) -> None:
+        _check_process()
         if not isinstance(replay, Replay):
             raise TypeError("replay must be Replay")
         channel = _channel_id(channel_id, "channel_id")
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             if self._bound is not None:
                 raise _in_use_error()
-            replay_handle = replay._attach()
+            replay_handle = replay._attach(self)
             try:
                 _check_code(
                     _native.output_attach_storage(self._handle, replay_handle, channel)
                 )
             except BaseException:
-                replay._attach_failed()
+                replay._attach_failed(self)
                 raise
             self._bound = replay
+            self._native_detached = False
 
     def detach(self) -> None:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             if self._bound is None:
                 _check_code(6029)
+            if self._detaching:
+                raise _in_use_error()
             bound = self._bound
-            _check_code(_native.output_detach_storage(self._handle))
-            self._bound = None
-            self._state = OutputState.IDLE
-        assert bound is not None
-        bound._detach()
-
-    def close(self) -> None:
-        with self._close_condition:
             callback = _callback_owner()
-            if (
-                callback is self
-                or (self._bound is not None and callback is self._bound)
-            ):
+            if callback is self or callback is bound:
                 raise _in_use_error()
-            while self._closing:
-                self._close_condition.wait()
-            if self._closed:
+            _retry_in_use(self._native_detach)
+            self._detaching = True
+            self._state = OutputState.IDLE
+        self._dispatcher.barrier()
+        with self._lock:
+            self._bound = None
+            self._detaching = False
+        assert bound is not None
+        bound._detach(self)
+
+    def _detach_from_parent(self, replay: Replay) -> None:
+        with self._lock:
+            if self._bound is not replay:
                 return
-            if self._dispatcher.in_callback:
+            if self._detaching:
                 raise _in_use_error()
-            self._closing = True
-            bound = self._bound
-        try:
-            if bound is not None:
-                _check_code(_native.output_detach_storage(self._handle))
-                with self._lock:
-                    self._bound = None
-                    self._state = OutputState.IDLE
-                bound._detach()
-            _check_code(_native.close(self._handle))
-            self._dispatcher.close()
-        except BaseException:
-            with self._close_condition:
-                self._closing = False
-                self._close_condition.notify_all()
-            raise
-        with self._close_condition:
-            self._closed = True
-            self._closing = False
-            self._close_condition.notify_all()
+            callback = _callback_owner()
+            if callback is self or callback is replay:
+                raise _in_use_error()
+            _retry_in_use(self._native_detach)
+            self._detaching = True
+            self._state = OutputState.IDLE
+        self._dispatcher.barrier()
+        with self._lock:
+            self._bound = None
+            self._detaching = False
+        replay._detach(self)
 
 
+@final
 class AudioOutput(_StorageOutputBase):
     _native_kind = "audio"
 
     def __init__(
         self,
-        on_frame: Callable[[tirtc.AudioFrame], None] | None = None,
+        on_frame: Callable[[tirtc.AudioFrame], None],
         *,
         on_state_changed: Callable[[tirtc.OutputState], None] | None = None,
         on_error: Callable[[tirtc.TiRTCError], None] | None = None,
@@ -616,12 +1010,13 @@ class AudioOutput(_StorageOutputBase):
         self._initialize_output(on_frame, on_state_changed, on_error)
 
 
+@final
 class VideoOutput(_StorageOutputBase):
     _native_kind = "video"
 
     def __init__(
         self,
-        on_frame: Callable[[tirtc.VideoFrame], None] | None = None,
+        on_frame: Callable[[tirtc.VideoFrame], None],
         *,
         on_state_changed: Callable[[tirtc.OutputState], None] | None = None,
         on_error: Callable[[tirtc.TiRTCError], None] | None = None,
@@ -629,20 +1024,21 @@ class VideoOutput(_StorageOutputBase):
         self._initialize_output(on_frame, on_state_changed, on_error)
 
     def take_snapshot(self) -> tirtc.SnapshotFile:
+        _check_process()
         with self._lock:
-            if self._closed or self._closing:
-                raise _closed_error()
+            self._close.require_open()
             code, path = _native.output_snapshot(self._handle)
         _check_code(code)
         return tirtc.SnapshotFile._create(str(path))
 
 
+@final
 class EncodedAudioOutput(_StorageOutputBase):
     _native_kind = "encoded_audio"
 
     def __init__(
         self,
-        on_frame: Callable[[tirtc.EncodedAudioFrame], None] | None = None,
+        on_frame: Callable[[tirtc.EncodedAudioFrame], None],
         *,
         on_state_changed: Callable[[tirtc.OutputState], None] | None = None,
         on_error: Callable[[tirtc.TiRTCError], None] | None = None,
@@ -650,12 +1046,13 @@ class EncodedAudioOutput(_StorageOutputBase):
         self._initialize_output(on_frame, on_state_changed, on_error)
 
 
+@final
 class EncodedVideoOutput(_StorageOutputBase):
     _native_kind = "encoded_video"
 
     def __init__(
         self,
-        on_frame: Callable[[tirtc.EncodedVideoFrame], None] | None = None,
+        on_frame: Callable[[tirtc.EncodedVideoFrame], None],
         *,
         on_state_changed: Callable[[tirtc.OutputState], None] | None = None,
         on_error: Callable[[tirtc.TiRTCError], None] | None = None,
@@ -663,119 +1060,232 @@ class EncodedVideoOutput(_StorageOutputBase):
         self._initialize_output(on_frame, on_state_changed, on_error)
 
 
+@final
 class ExportTask:
     def __init__(self) -> None:
         raise TypeError("ExportTask values are created by CloudStorage.export_recording()")
 
-    def _prepare(self, parent: CloudStorage) -> None:
+    def _prepare(
+        self,
+        parent: CloudStorage,
+        on_progress: Callable[[ExportProgress], None] | None,
+        on_recording_gap: Callable[[RecordingGap], None] | None,
+    ) -> None:
         self._parent = parent
         self._handle = None
         self._lock = threading.RLock()
-        self._condition = threading.Condition(self._lock)
-        self._stop_lock = threading.Lock()
-        self._stopping = False
+        self._close = _CloseCoordinator(self._lock)
         self._done = threading.Event()
-        self._progress = 0.0
+        self._progress = ExportProgress(0.0, 0)
+        self._report: ExportReport | None = None
+        self._on_progress = on_progress
+        self._on_recording_gap = on_recording_gap
+        self._dispatcher = _Dispatcher(self._handle_event)
         self._terminal = False
-        self._finalized = False
+        self._parent_finished = False
         self._file: tirtc.RecordingFile | None = None
         self._error: BaseException | None = None
 
     def _native_sink(self):
-        reference = weakref.ref(self)
+        return _native_task_sink(self._dispatcher)
 
-        def sink(kind: str, *values: object) -> None:
-            task = reference()
-            if task is None:
-                return
-            with task._lock:
-                if kind == "progress" and not task._terminal:
-                    task._progress = max(task._progress, min(float(values[0]), 1.0))
-                elif kind == "completed" and not task._terminal:
+    def _handle_event(self, kind: str, *values: object) -> None:
+        with _active_callback(self):
+            if kind == "progress":
+                progress = ExportProgress(float(values[0]), int(values[1]))
+                with self._lock:
+                    if self._terminal or progress.fraction < self._progress.fraction:
+                        return
+                    self._progress = progress
+                if self._on_progress is not None:
+                    self._on_progress(progress)
+            elif kind == "gap":
+                if self._on_recording_gap is not None:
+                    self._on_recording_gap(_recording_gap_from_native(values[0]))
+            elif kind == "completed":
+                with self._lock:
+                    if self._terminal:
+                        return
                     code = int(values[0])
-                    task._terminal = True
-                    task._progress = 1.0 if code == 0 else task._progress
-                    task._file = (
+                    self._terminal = True
+                    self._file = (
                         tirtc.RecordingFile._create(str(values[1]), int(values[2]))
                         if code == 0
                         else None
                     )
-                    task._error = (
+                    self._error = (
                         _error_from_code(code, _error_name(code)) if code else None
                     )
-                    task._done.set()
-
-        return sink
+                    self._done.set()
 
     @property
     def progress(self) -> float:
+        return self.progress_detail.fraction
+
+    @property
+    def progress_detail(self) -> ExportProgress:
+        _check_process()
         with self._lock:
-            if not self._terminal and self._handle is not None:
-                code, value = _native.export_progress(self._handle)
+            if self._close.status == "open" and self._handle is not None:
+                code, fraction, covered = _native.export_progress(self._handle)
                 _check_code(code)
-                self._progress = max(self._progress, min(float(value), 1.0))
+                current = ExportProgress(min(max(float(fraction), 0.0), 1.0), int(covered))
+                if current.fraction >= self._progress.fraction:
+                    self._progress = current
             return self._progress
 
-    def _finish(self) -> tirtc.RecordingFile:
-        with self._condition:
-            while self._stopping:
-                self._condition.wait()
-            if not self._finalized:
-                _destroy_with_barrier(self._handle)
-                self._finalized = True
-                self._parent._finish_task()
-            error = self._error
-            result = self._file
+    def _load_report(self) -> ExportReport:
+        with self._lock:
+            if self._report is not None:
+                return self._report
+            code, value = _native.export_report(self._handle)
+            _check_code(code)
+            progress_code, fraction, covered = _native.export_progress(self._handle)
+            _check_code(progress_code)
+            self._progress = ExportProgress(float(fraction), int(covered))
+            self._report = _export_report_from_native(value)
+            return self._report
+
+    @property
+    def report(self) -> ExportReport:
+        _check_process()
+        with self._lock:
+            if not self._terminal:
+                raise _in_use_error()
+        return self._load_report()
+
+    def _result_or_error(self) -> tirtc.RecordingFile:
+        error = self._error
+        result = self._file
         if error is not None:
-            raise error
+            raise _copy_error(error)
         assert result is not None
         return result
 
+    def _finish(self) -> tirtc.RecordingFile:
+        with self._lock:
+            generation = self._close.begin()
+            if generation is None:
+                return self._result_or_error()
+        try:
+            self._load_report()
+            self._dispatcher.close()
+            _destroy_with_barrier(self._handle)
+            if not self._parent_finished:
+                self._parent._finish_export(self)
+                self._parent_finished = True
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation, self._error)
+        return self._result_or_error()
+
     def wait(self, *, timeout: float | None = None) -> tirtc.RecordingFile:
+        _check_process()
+        if _callback_owner() is self:
+            raise _in_use_error()
         if not self._done.wait(_timeout(timeout)):
             raise _timeout_error()
         return self._finish()
 
+    def cancel(self) -> None:
+        _check_process()
+        with self._lock:
+            if self._terminal:
+                return
+            self._close.require_open()
+            handle = self._handle
+        _check_code(_native.export_cancel(handle))
+
+    def _close_from_parent(self) -> None:
+        with self._lock:
+            terminal = self._terminal
+        if not terminal:
+            self.cancel()
+        try:
+            result = self.wait()
+        except tirtc.TiRTCError:
+            with self._lock:
+                if self._close.status != "closed":
+                    raise
+        else:
+            result.delete()
+
     def stop(self) -> tirtc.RecordingFile:
-        with self._stop_lock:
-            with self._condition:
-                terminal = self._terminal
-                if not terminal:
-                    self._stopping = True
+        _check_process()
+        if _callback_owner() is self:
+            raise _in_use_error()
+        with self._lock:
+            generation = self._close.begin()
+            if generation is None:
+                return self._result_or_error()
+            terminal = self._terminal
+        try:
             if not terminal:
-                try:
-                    code, path, duration_ms = _native.export_stop(self._handle)
-                    with self._condition:
-                        if not self._terminal:
-                            self._terminal = True
-                            self._file = (
-                                tirtc.RecordingFile._create(str(path), int(duration_ms))
-                                if code == 0
-                                else None
-                            )
-                            self._error = (
-                                _error_from_code(code, _error_name(code)) if code else None
-                            )
-                            self._done.set()
-                finally:
-                    with self._condition:
-                        self._stopping = False
-                        self._condition.notify_all()
-        return self._finish()
+                code, path, duration_ms = _retry_in_use_result(
+                    _native.export_stop, self._handle
+                )
+                with self._lock:
+                    if not self._terminal:
+                        self._terminal = True
+                        self._file = (
+                            tirtc.RecordingFile._create(str(path), int(duration_ms))
+                            if code == 0
+                            else None
+                        )
+                        self._error = (
+                            _error_from_code(code, _error_name(code)) if code else None
+                        )
+                        self._done.set()
+            self._load_report()
+            self._dispatcher.close()
+            _destroy_with_barrier(self._handle)
+            if not self._parent_finished:
+                self._parent._finish_export(self)
+                self._parent_finished = True
+        except BaseException as error:
+            self._close.fail(generation, error)
+            raise
+        self._close.succeed(generation, self._error)
+        return self._result_or_error()
+
+    def __del__(self) -> None:
+        close = getattr(self, "_close", None)
+        if (
+            close is None
+            or close.status == "closed"
+            or getattr(self, "_handle", None) is None
+        ):
+            return
+        try:
+            warnings.warn("unclosed TiRTC ExportTask", ResourceWarning, stacklevel=2)
+            if sys.is_finalizing() or not _process_is_current():
+                return
+            result = self.stop()
+            result.delete()
+        except BaseException:
+            pass
 
 
 __all__ = [
     "AudioOutput",
+    "Client",
     "CloudStorage",
     "EncodedAudioOutput",
     "EncodedVideoOutput",
+    "ExportProgress",
+    "ExportReport",
+    "ExportSegment",
+    "ExportTermination",
     "ExportTask",
+    "RecordingGap",
+    "RecordingGapReason",
+    "RecordingTrack",
+    "RecordingTrackKind",
     "RecordingDay",
     "RecordingRange",
     "RecordingTask",
     "Replay",
     "ReplaySpeed",
     "VideoOutput",
-    "initialize",
-    "shutdown",
 ]
