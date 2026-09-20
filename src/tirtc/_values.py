@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 
 
 class _SDKValue:
@@ -91,6 +92,16 @@ class VideoBitstreamFormat(StrEnum):
     MJPEG_JFIF = "mjpeg_jfif"
 
 
+class RawDumpStopReason(StrEnum):
+    UNKNOWN = "unknown"
+    USER = "user"
+    TIME_LIMIT = "time_limit"
+    BYTE_LIMIT = "byte_limit"
+    SOURCE_CLOSED = "source_closed"
+    RESOURCE_LIMIT = "resource_limit"
+    WRITE_FAILED = "write_failed"
+
+
 @dataclass(frozen=True, slots=True)
 class OutputBufferOptions:
     strategy: OutputBufferStrategy = OutputBufferStrategy.AUTOMATIC
@@ -153,6 +164,20 @@ class EncodedVideoFrame(_SDKValue):
     discontinuity: bool
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class RawDumpArchive(_SDKValue):
+    capture_id: str
+    path: Path
+    size: int
+    sha256: str
+    captured_duration: timedelta
+    capture_complete: bool
+    stop_reason: RawDumpStopReason
+    unsaved_packet_count: int
+    unsaved_byte_count: int
+    empty: bool
+
+
 def _value(value_type: type, **fields: object):
     value = object.__new__(value_type)
     for name, field_value in fields.items():
@@ -180,3 +205,12 @@ _VIDEO_CODECS_BY_NATIVE = {
 }
 _AUDIO_BITSTREAM_FORMATS = tuple(AudioBitstreamFormat)
 _VIDEO_BITSTREAM_FORMATS = tuple(VideoBitstreamFormat)
+_RAW_DUMP_STOP_REASONS = {
+    0: RawDumpStopReason.UNKNOWN,
+    1: RawDumpStopReason.USER,
+    2: RawDumpStopReason.TIME_LIMIT,
+    3: RawDumpStopReason.BYTE_LIMIT,
+    4: RawDumpStopReason.SOURCE_CLOSED,
+    5: RawDumpStopReason.RESOURCE_LIMIT,
+    6: RawDumpStopReason.WRITE_FAILED,
+}

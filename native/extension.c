@@ -56,6 +56,7 @@ typedef enum HandleKind {
   HANDLE_DAYS_REQUEST,
   HANDLE_REPLAY,
   HANDLE_STORAGE_RECORDING,
+  HANDLE_RAW_DUMP,
   HANDLE_EXPORT,
 } HandleKind;
 
@@ -215,6 +216,8 @@ static TiError close_pointer(NativeHandle* handle) {
       return ti_cloud_storage_replay_destroy((TiCloudStorageReplay*)handle->pointer);
     case HANDLE_STORAGE_RECORDING:
       return ti_cloud_storage_recording_task_destroy((TiCloudStorageRecordingTask*)handle->pointer);
+    case HANDLE_RAW_DUMP:
+      return ti_raw_dump_destroy((TiRawDump*)handle->pointer);
     case HANDLE_EXPORT:
       return ti_cloud_storage_export_task_destroy((TiCloudStorageExportTask*)handle->pointer);
   }
@@ -265,6 +268,8 @@ static const char* handle_kind_name(HandleKind kind) {
     case HANDLE_RTC_RECORDING:
     case HANDLE_STORAGE_RECORDING:
       return "RecordingTask";
+    case HANDLE_RAW_DUMP:
+      return "RawDump";
     case HANDLE_STORAGE_CLIENT:
       return "CloudStorageClient";
     case HANDLE_STORAGE:
@@ -1525,6 +1530,100 @@ static PyObject* py_recording_stop(PyObject* module, PyObject* argument) {
   return result;
 }
 
+static PyObject* py_rtc_raw_dump_start(PyObject* module, PyObject* arguments) {
+  (void)module;
+  PyObject* capsule;
+  const char* audio;
+  const char* video;
+  Py_ssize_t audio_size;
+  Py_ssize_t video_size;
+  if (!PyArg_ParseTuple(arguments, "Oy#y#", &capsule, &audio, &audio_size, &video, &video_size))
+    return NULL;
+  NativeHandle* connection = get_handle(capsule, HANDLE_CONNECTION);
+  if (connection == NULL)
+    return NULL;
+  NativeHandle* handle = handle_new(HANDLE_RAW_DUMP, NULL, capsule);
+  if (handle == NULL)
+    return NULL;
+  PyObject* result = handle_result(handle);
+  if (result == NULL)
+    return NULL;
+  TiRtcRawDumpOptions options = TI_RTC_RAW_DUMP_OPTIONS_INITIALIZER;
+  options.audio_stream_ids = (const uint8_t*)audio;
+  options.audio_stream_id_count = (size_t)audio_size;
+  options.video_stream_ids = (const uint8_t*)video;
+  options.video_stream_id_count = (size_t)video_size;
+  options.uplink_audio_stream_ids = NULL;
+  options.uplink_audio_stream_id_count = 0;
+  TiRawDump* dump = NULL;
+  TiError error;
+  Py_BEGIN_ALLOW_THREADS error =
+      tirtc_conn_start_raw_dump((TiRtcConn*)connection->pointer, &options, &dump);
+  Py_END_ALLOW_THREADS handle->pointer = dump;
+  if (error != TI_ERROR_OK) {
+    discard_handle_result(result, handle);
+    return Py_BuildValue("(iO)", error, Py_None);
+  }
+  return result;
+}
+
+static PyObject* py_storage_raw_dump_start(PyObject* module, PyObject* arguments) {
+  (void)module;
+  PyObject* capsule;
+  const char* audio;
+  const char* video;
+  Py_ssize_t audio_size;
+  Py_ssize_t video_size;
+  if (!PyArg_ParseTuple(arguments, "Oy#y#", &capsule, &audio, &audio_size, &video, &video_size))
+    return NULL;
+  NativeHandle* replay = get_handle(capsule, HANDLE_REPLAY);
+  if (replay == NULL)
+    return NULL;
+  NativeHandle* handle = handle_new(HANDLE_RAW_DUMP, NULL, capsule);
+  if (handle == NULL)
+    return NULL;
+  PyObject* result = handle_result(handle);
+  if (result == NULL)
+    return NULL;
+  TiCloudStorageRawDumpOptions options = TI_CLOUD_STORAGE_RAW_DUMP_OPTIONS_INITIALIZER;
+  options.audio_channel_ids = (const uint8_t*)audio;
+  options.audio_channel_id_count = (size_t)audio_size;
+  options.video_channel_ids = (const uint8_t*)video;
+  options.video_channel_id_count = (size_t)video_size;
+  TiRawDump* dump = NULL;
+  TiError error;
+  Py_BEGIN_ALLOW_THREADS error = ti_cloud_storage_replay_start_raw_dump(
+      (TiCloudStorageReplay*)replay->pointer, &options, &dump);
+  Py_END_ALLOW_THREADS handle->pointer = dump;
+  if (error != TI_ERROR_OK) {
+    discard_handle_result(result, handle);
+    return Py_BuildValue("(iO)", error, Py_None);
+  }
+  return result;
+}
+
+static PyObject* py_raw_dump_stop(PyObject* module, PyObject* argument) {
+  (void)module;
+  NativeHandle* handle = get_handle(argument, HANDLE_RAW_DUMP);
+  if (handle == NULL)
+    return NULL;
+  TiRawDumpArchive value = TI_RAW_DUMP_ARCHIVE_INITIALIZER;
+  TiError error;
+  Py_BEGIN_ALLOW_THREADS error = ti_raw_dump_stop((TiRawDump*)handle->pointer, &value);
+  Py_END_ALLOW_THREADS return Py_BuildValue(
+      "(issKsKiIKKi)", error,
+      error == TI_ERROR_OK && value.capture_id != NULL ? value.capture_id : "",
+      error == TI_ERROR_OK && value.file_path != NULL ? value.file_path : "",
+      error == TI_ERROR_OK ? value.file_size : 0,
+      error == TI_ERROR_OK && value.sha256 != NULL ? value.sha256 : "",
+      error == TI_ERROR_OK ? value.captured_duration_ms : 0,
+      error == TI_ERROR_OK ? value.capture_complete != 0 : 0,
+      error == TI_ERROR_OK ? value.stop_reason : TI_RAW_DUMP_STOP_REASON_UNKNOWN,
+      error == TI_ERROR_OK ? value.unsaved_packet_count : 0,
+      error == TI_ERROR_OK ? value.unsaved_byte_count : 0,
+      error == TI_ERROR_OK ? value.empty != 0 : 1);
+}
+
 static PyObject* py_storage_client_create(PyObject* module, PyObject* arguments) {
   (void)module;
   const char* app_id;
@@ -2245,6 +2344,9 @@ static PyMethodDef module_methods[] = {
     {"rtc_recording_start", py_rtc_recording_start, METH_VARARGS, NULL},
     {"storage_recording_start", py_storage_recording_start, METH_VARARGS, NULL},
     {"recording_stop", py_recording_stop, METH_O, NULL},
+    {"rtc_raw_dump_start", py_rtc_raw_dump_start, METH_VARARGS, NULL},
+    {"storage_raw_dump_start", py_storage_raw_dump_start, METH_VARARGS, NULL},
+    {"raw_dump_stop", py_raw_dump_stop, METH_O, NULL},
     {"storage_client_create", py_storage_client_create, METH_VARARGS, NULL},
     {"storage_client_open_device", py_storage_client_open_device, METH_VARARGS, NULL},
     {"storage_create", py_storage_create, METH_O, NULL},

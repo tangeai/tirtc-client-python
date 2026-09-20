@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import json
 from datetime import timedelta
 import math
 import os
@@ -81,8 +82,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-stream-id", type=int, action="append")
     parser.add_argument("--no-receive-audio", action="store_true")
     parser.add_argument("--no-receive-video", action="store_true")
+    parser.add_argument(
+        "--raw-dump",
+        action="store_true",
+        help="capture the selected encoded inputs and return the diagnostic ZIP",
+    )
+    parser.add_argument("--raw-dump-seconds", type=float, default=10.0)
+    parser.add_argument("--raw-dump-copy-to", type=Path)
+    parser.add_argument("--upload-logs", action="store_true")
+    parser.add_argument(
+        "--case-id",
+        choices=("smoke.raw-dump-upload", "integration.raw-dump-recovery"),
+        help="run one registered raw dump RTC case through this public Example",
+    )
     parser.add_argument("--timeout", type=float, default=90.0, help="overall timeout in seconds")
     args = parser.parse_args()
+    if args.case_id is not None:
+        args.raw_dump = True
+        args.upload_logs = True
     if not args.cache_dir.is_absolute() or not args.output_dir.is_absolute():
         parser.error("--cache-dir and --output-dir must be absolute")
     if args.no_receive_audio and args.audio_stream_id is not None:
@@ -107,6 +124,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("audio and video stream IDs must differ")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be finite and positive")
+    if not math.isfinite(args.raw_dump_seconds) or not 0 < args.raw_dump_seconds <= 300:
+        parser.error("--raw-dump-seconds must be finite and from 0 through 300 seconds")
+    if args.raw_dump_copy_to is not None and (
+        not args.raw_dump or not args.raw_dump_copy_to.is_absolute()
+    ):
+        parser.error("--raw-dump-copy-to requires --raw-dump and an absolute path")
+    if args.raw_dump and args.audio_stream_id is None and not args.video_stream_ids:
+        parser.error("--raw-dump requires at least one selected audio or video stream")
     return args
 
 
@@ -249,8 +274,56 @@ def run() -> None:
             connection.subscribe_video(stream_id)
             connection.request_video_keyframe(stream_id)
             required_frames.extend((f"video:{stream_id}", f"encoded_video:{stream_id}"))
+        dump: tirtc.RawDump | None = None
+        capture_deadline = 0.0
+        if args.raw_dump:
+            raw_dump_options = tirtc.RawDumpOptions(
+                audio_stream_ids=(
+                    () if args.audio_stream_id is None else (args.audio_stream_id,)
+                ),
+                video_stream_ids=tuple(args.video_stream_ids),
+            )
+            dump = connection.start_raw_dump(raw_dump_options)
+            stack.callback(dump.close)
+            if args.case_id == "integration.raw-dump-recovery":
+                try:
+                    connection.start_raw_dump(raw_dump_options)
+                except tirtc.InUseError:
+                    pass
+                else:
+                    raise RuntimeError("duplicate raw dump start was accepted")
+            capture_deadline = time.monotonic() + args.raw_dump_seconds
+            if capture_deadline > deadline:
+                raise TimeoutError("raw dump duration exceeds the remaining example timeout")
         if required_frames:
             signals.wait_after(tuple(required_frames), {}, deadline)
+
+        if dump is not None:
+            time.sleep(max(0, capture_deadline - time.monotonic()))
+            archive = dump.stop()
+            if not archive.capture_id or not archive.path.is_file():
+                raise RuntimeError("raw dump did not return a readable archive")
+            if archive.path.stat().st_size != archive.size:
+                raise RuntimeError("raw dump archive size does not match its metadata")
+            if args.raw_dump_copy_to is not None:
+                args.raw_dump_copy_to.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(archive.path, args.raw_dump_copy_to)
+            if args.case_id == "integration.raw-dump-recovery" and dump.stop() is not archive:
+                raise RuntimeError("repeated raw dump stop changed the terminal result")
+            print(json.dumps({
+                "raw_dump": {
+                    "capture_id": archive.capture_id,
+                    "path": str(archive.path),
+                    "size": archive.size,
+                    "sha256": archive.sha256,
+                    "captured_duration_ms": int(archive.captured_duration.total_seconds() * 1000),
+                    "capture_complete": archive.capture_complete,
+                    "stop_reason": archive.stop_reason.value,
+                    "unsaved_packet_count": archive.unsaved_packet_count,
+                    "unsaved_byte_count": archive.unsaved_byte_count,
+                    "empty": archive.empty,
+                }
+            }, sort_keys=True))
 
         for stream_id, video, _ in video_outputs:
             recording = connection.start_recording(
@@ -300,6 +373,8 @@ def run() -> None:
             raise TimeoutError("timed out waiting for remote command")
         if not message_received.wait(max(0, deadline - time.monotonic())):
             raise TimeoutError("timed out waiting for remote stream message")
+        if args.upload_logs:
+            print(json.dumps({"log_id": client.upload_logs()}, sort_keys=True))
 
         for stream_id, video, encoded_video in reversed(video_outputs):
             connection.unsubscribe_video(stream_id)

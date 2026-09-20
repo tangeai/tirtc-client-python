@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tange.ai/schemas/tirtc/raw-dump.schema.json",
+  "title": "TiRTC Raw Dump Manifest v1/v2",
+  "type": "object",
+  "required": [
+    "format", "version", "capture_id", "source_kind", "observation_point",
+    "started_at_utc", "finished_at_utc", "duration_us", "runtime_version",
+    "sdk_version", "nano_version", "identity_missing_reasons", "selected_sources",
+    "stop_reason", "capture_complete", "empty", "counters", "limits", "streams",
+    "objects", "files"
+  ],
+  "properties": {
+    "format": { "const": "tirtc.raw-dump" },
+    "version": { "enum": [1, 2] },
+    "capture_id": { "type": "string", "minLength": 1 },
+    "source_kind": { "enum": ["rtc", "cloud_storage"] },
+    "observation_point": { "type": "string", "minLength": 1 },
+    "started_at_utc": { "type": ["string", "null"] },
+    "finished_at_utc": { "type": ["string", "null"] },
+    "duration_us": { "$ref": "#/$defs/decimal" },
+    "runtime_version": { "type": ["string", "null"] },
+    "sdk_version": { "type": ["string", "null"] },
+    "nano_version": { "type": ["string", "null"] },
+    "identity_missing_reasons": {
+      "type": "object",
+      "properties": {
+        "runtime_version": { "type": "string", "minLength": 1 },
+        "sdk_version": { "type": "string", "minLength": 1 },
+        "nano_version": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "selected_sources": { "type": "array", "minItems": 1 },
+    "stop_reason": {
+      "enum": ["user", "time_limit", "byte_limit", "source_closed", "resource_limit", "write_failed", "unknown"]
+    },
+    "capture_complete": { "type": "boolean" },
+    "empty": { "type": "boolean" },
+    "counters": {
+      "type": "object",
+      "required": ["observed_packets", "observed_bytes", "written_packets", "written_bytes", "unsaved_packets", "unsaved_bytes"],
+      "additionalProperties": { "$ref": "#/$defs/decimal" }
+    },
+    "limits": { "type": "object", "additionalProperties": { "$ref": "#/$defs/decimal" } },
+    "streams": { "type": "array" },
+    "objects": { "type": "array", "items": { "$ref": "#/$defs/object" } },
+    "files": { "type": "array", "items": { "$ref": "#/$defs/file" } },
+    "first_failure": { "type": ["object", "null"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "version": { "const": 1 } } },
+      "then": {
+        "properties": {
+          "selected_sources": { "items": { "$ref": "#/$defs/selectedV1" } },
+          "streams": { "items": { "$ref": "#/$defs/streamV1" } }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "version": { "const": 2 } } },
+      "then": {
+        "properties": {
+          "source_kind": { "const": "rtc" },
+          "selected_sources": {
+            "items": { "$ref": "#/$defs/selectedV2" },
+            "contains": {
+              "type": "object",
+              "required": ["media_kind", "direction"],
+              "properties": { "media_kind": { "const": "audio" }, "direction": { "const": "uplink" } }
+            }
+          },
+          "streams": { "items": { "$ref": "#/$defs/streamV2" } },
+          "objects": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "decimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "provenance": { "enum": ["source_header", "bitstream_observed", "unknown"] },
+    "file": {
+      "type": "object",
+      "required": ["path", "length", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "length": { "$ref": "#/$defs/decimal" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": true
+    },
+    "selectedV1": {
+      "type": "object",
+      "required": ["media_kind", "source_id"],
+      "properties": {
+        "media_kind": { "enum": ["audio", "video"] },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 255 }
+      },
+      "not": { "required": ["direction"] },
+      "additionalProperties": true
+    },
+    "selectedV2": {
+      "type": "object",
+      "required": ["media_kind", "direction", "source_id"],
+      "properties": {
+        "media_kind": { "enum": ["audio", "video"] },
+        "direction": { "enum": ["downlink", "uplink"] },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 15 }
+      },
+      "allOf": [{
+        "if": { "properties": { "direction": { "const": "uplink" } } },
+        "then": { "properties": { "media_kind": { "const": "audio" } } }
+      }],
+      "additionalProperties": true
+    },
+    "downlinkSegment": {
+      "type": "object",
+      "required": ["segment_id", "codec", "framing", "codec_provenance", "framing_provenance", "data", "index"],
+      "properties": {
+        "segment_id": { "type": ["string", "integer"] },
+        "source_epoch": { "type": ["string", "null"] },
+        "read_epoch": { "type": ["string", "null"] },
+        "codec": { "type": "string", "minLength": 1 },
+        "framing": { "type": "string", "minLength": 1 },
+        "codec_provenance": { "$ref": "#/$defs/provenance" },
+        "framing_provenance": { "$ref": "#/$defs/provenance" },
+        "data": { "$ref": "#/$defs/file" },
+        "index": { "$ref": "#/$defs/file" },
+        "codec_config": { "anyOf": [{ "$ref": "#/$defs/file" }, { "type": "null" }] }
+      },
+      "additionalProperties": true
+    },
+    "streamV1": {
+      "type": "object",
+      "required": ["media_kind", "source_id", "segments"],
+      "properties": {
+        "stream_id": { "type": "string" },
+        "media_kind": { "enum": ["audio", "video"] },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/downlinkSegment" } }
+      },
+      "not": { "required": ["direction"] },
+      "additionalProperties": true
+    },
+    "downlinkStreamV2": {
+      "type": "object",
+      "required": ["media_kind", "direction", "source_id", "segments"],
+      "properties": {
+        "media_kind": { "enum": ["audio", "video"] },
+        "direction": { "const": "downlink" },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/downlinkSegment" } }
+      },
+      "additionalProperties": true
+    },
+    "pcmFormat": {
+      "type": "object",
+      "required": ["encoding", "sample_rate_hz", "channels", "bits_per_sample"],
+      "properties": {
+        "encoding": { "const": "s16le" },
+        "sample_rate_hz": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "bits_per_sample": { "const": 16 }
+      },
+      "additionalProperties": false
+    },
+    "uplinkSegmentBase": {
+      "type": "object",
+      "required": ["segment_id", "source_instance_id", "record_count", "byte_count", "format", "data", "index"],
+      "properties": {
+        "segment_id": { "type": "integer", "minimum": 1 },
+        "source_instance_id": { "$ref": "#/$defs/decimal" },
+        "record_count": { "$ref": "#/$defs/decimal" },
+        "byte_count": { "$ref": "#/$defs/decimal" },
+        "format": { "$ref": "#/$defs/pcmFormat" },
+        "data": { "$ref": "#/$defs/file" },
+        "index": { "$ref": "#/$defs/file" }
+      },
+      "additionalProperties": true
+    },
+    "pcmUplinkSegment": {
+      "allOf": [
+        { "$ref": "#/$defs/uplinkSegmentBase" },
+        { "not": { "anyOf": [{ "required": ["codec"] }, { "required": ["framing"] }, { "required": ["codec_config"] }] } }
+      ]
+    },
+    "encodedUplinkSegment": {
+      "allOf": [
+        { "$ref": "#/$defs/uplinkSegmentBase" },
+        {
+          "type": "object",
+          "required": ["codec", "framing", "codec_provenance", "framing_provenance", "codec_config"],
+          "properties": {
+            "codec": { "type": "string", "minLength": 1 },
+            "framing": { "type": "string", "minLength": 1 },
+            "codec_provenance": { "$ref": "#/$defs/provenance" },
+            "framing_provenance": { "$ref": "#/$defs/provenance" },
+            "codec_config": { "anyOf": [{ "$ref": "#/$defs/file" }, { "type": "null" }] }
+          }
+        }
+      ]
+    },
+    "uplinkStage": {
+      "type": "object",
+      "required": ["stage", "segments"],
+      "properties": {
+        "stage": { "enum": ["captured", "render_reference", "processed", "encoded"] },
+        "segments": { "type": "array", "minItems": 1 }
+      },
+      "allOf": [{
+        "if": { "properties": { "stage": { "const": "encoded" } } },
+        "then": { "properties": { "segments": { "items": { "$ref": "#/$defs/encodedUplinkSegment" } } } },
+        "else": { "properties": { "segments": { "items": { "$ref": "#/$defs/pcmUplinkSegment" } } } }
+      }],
+      "additionalProperties": true
+    },
+    "uplinkStreamV2": {
+      "type": "object",
+      "required": ["media_kind", "direction", "source_id", "stages"],
+      "properties": {
+        "media_kind": { "const": "audio" },
+        "direction": { "const": "uplink" },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "stages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/uplinkStage" } }
+      },
+      "additionalProperties": true
+    },
+    "streamV2": {
+      "oneOf": [{ "$ref": "#/$defs/downlinkStreamV2" }, { "$ref": "#/$defs/uplinkStreamV2" }]
+    },
+    "object": {
+      "type": "object",
+      "required": ["object_id", "download_attempt_id", "data", "ranges", "expected_size", "received_bytes", "complete", "acquired_before_capture", "result", "result_stage", "parse_result", "parse_stage", "expected_sha256", "actual_sha256"],
+      "properties": {
+        "object_id": { "$ref": "#/$defs/decimal" },
+        "download_attempt_id": { "$ref": "#/$defs/decimal" },
+        "data": { "$ref": "#/$defs/file" },
+        "ranges": { "$ref": "#/$defs/file" },
+        "expected_size": { "$ref": "#/$defs/decimal" },
+        "received_bytes": { "$ref": "#/$defs/decimal" },
+        "complete": { "type": "boolean" },
+        "acquired_before_capture": { "type": "boolean" },
+        "result": { "type": "integer" },
+        "result_stage": { "type": "string", "minLength": 1 },
+        "parse_result": { "type": "integer" },
+        "parse_stage": { "type": "string", "minLength": 1 },
+        "expected_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "actual_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] }
+      },
+      "additionalProperties": true
+    }
+  }
+}

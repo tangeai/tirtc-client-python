@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from collections.abc import Callable
+from dataclasses import dataclass
 import logging
 from pathlib import Path
 import sys
@@ -20,6 +21,7 @@ from ._errors import (
     _timeout_error,
 )
 from ._lifecycle import _CloseCoordinator, _copy_error
+from ._raw_dump import RawDump, normalize_raw_dump_ids
 from ._runtime import (
     ClientOptions,
     _RuntimeLease,
@@ -61,6 +63,8 @@ from ._values import (
     VideoDecoderPreference,
     VideoFrame,
     VideoPlane,
+    RawDumpArchive,
+    RawDumpStopReason,
     _AUDIO_BITSTREAM_FORMATS,
     _AUDIO_CODECS,
     _AUDIO_SAMPLE_FORMATS,
@@ -74,6 +78,20 @@ from ._values import (
 
 
 _LOGGER = logging.getLogger("tirtc")
+
+
+@dataclass(frozen=True, slots=True)
+class RawDumpOptions:
+    audio_stream_ids: tuple[int, ...] = ()
+    video_stream_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        audio = normalize_raw_dump_ids(self.audio_stream_ids, "audio_stream_ids", 15)
+        video = normalize_raw_dump_ids(self.video_stream_ids, "video_stream_ids", 15)
+        if not audio and not video:
+            raise ValueError("at least one audio or video stream must be selected")
+        object.__setattr__(self, "audio_stream_ids", audio)
+        object.__setattr__(self, "video_stream_ids", video)
 
 
 def error_name(code: int) -> str:
@@ -320,14 +338,23 @@ class Client:
                 return
             connections = tuple(self._connections)
         try:
+            child_error: BaseException | None = None
             for connection in connections:
-                connection._close_from_client()
+                try:
+                    connection._close_from_client()
+                except BaseException as error:
+                    if connection._close.status != "closed":
+                        raise
+                    if child_error is None:
+                        child_error = error
             self._lease.close()
         except BaseException as error:
             self._close.fail(generation, error)
             raise
-        self._close.succeed(generation)
+        self._close.succeed(generation, child_error)
         _LOGGER.info("RTC Client closed")
+        if child_error is not None:
+            raise child_error
 
     def __del__(self) -> None:
         close = getattr(self, "_close", None)
@@ -371,6 +398,7 @@ class Connection:
         self._state = ConnectionState.IDLE
         self._outputs: set[_OutputBase] = set()
         self._tasks: set[RecordingTask] = set()
+        self._dumps: set[RawDump] = set()
         self._lock = threading.RLock()
         self._close = _CloseCoordinator(self._lock)
         self._disconnect_finished = False
@@ -681,6 +709,29 @@ class Connection:
             task._handle = handle
             return task
 
+    def start_raw_dump(self, options: RawDumpOptions) -> RawDump:
+        _check_process()
+        if not isinstance(options, RawDumpOptions):
+            raise TypeError("options must be RawDumpOptions")
+        callback = _callback_owner()
+        if callback is self or getattr(callback, "_bound", None) is self:
+            raise _in_use_error()
+        with self._lock:
+            self._close.require_open()
+            code, handle = _native.rtc_raw_dump_start(
+                self._handle,
+                bytes(options.audio_stream_ids),
+                bytes(options.video_stream_ids),
+            )
+            _check_code(code)
+            dump = RawDump._create(self, handle)
+            self._dumps.add(dump)
+            return dump
+
+    def _finish_raw_dump(self, dump: RawDump) -> None:
+        with self._lock:
+            self._dumps.discard(dump)
+
     def _finish_task(self, task: RecordingTask) -> None:
         with self._lock:
             self._tasks.discard(task)
@@ -717,6 +768,7 @@ class Connection:
                 return
             outputs = tuple(self._outputs)
             tasks = tuple(self._tasks)
+            dumps = tuple(self._dumps)
             attempt = self._active_connect
         try:
             if attempt is not None:
@@ -726,6 +778,15 @@ class Connection:
                 attempt.finished.wait()
             for output in outputs:
                 output._detach_from_parent(self)
+            raw_dump_error: BaseException | None = None
+            for dump in dumps:
+                try:
+                    dump.close()
+                except BaseException as error:
+                    if not dump._closed:
+                        raise
+                    if raw_dump_error is None:
+                        raw_dump_error = error
             for task in tasks:
                 result = task.stop()
                 result.delete()
@@ -744,9 +805,11 @@ class Connection:
             raise
         with self._lock:
             self._state = ConnectionState.DISCONNECTED
-        self._close.succeed(generation)
+        self._close.succeed(generation, raw_dump_error)
         self._client._finish_connection(self)
         _LOGGER.debug("connection closed")
+        if raw_dump_error is not None:
+            raise raw_dump_error
 
     def __del__(self) -> None:
         close = getattr(self, "_close", None)

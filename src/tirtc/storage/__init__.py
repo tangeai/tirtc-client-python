@@ -22,6 +22,7 @@ from tirtc._errors import (
     _timeout_error,
 )
 from tirtc._lifecycle import _CloseCoordinator, _copy_error
+from tirtc._raw_dump import RawDump, normalize_raw_dump_ids
 from tirtc._runtime import (
     ClientOptions,
     _RuntimeLease,
@@ -54,6 +55,20 @@ class ReplaySpeed(StrEnum):
     X2 = "2x"
     X4 = "4x"
     X8 = "8x"
+
+
+@dataclass(frozen=True, slots=True)
+class RawDumpOptions:
+    audio_channel_ids: tuple[int, ...] = ()
+    video_channel_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        audio = normalize_raw_dump_ids(self.audio_channel_ids, "audio_channel_ids", 255)
+        video = normalize_raw_dump_ids(self.video_channel_ids, "video_channel_ids", 255)
+        if not audio and not video:
+            raise ValueError("at least one audio or video channel must be selected")
+        object.__setattr__(self, "audio_channel_ids", audio)
+        object.__setattr__(self, "video_channel_ids", video)
 
 
 _REPLAY_SPEED_TO_NATIVE = {
@@ -274,13 +289,22 @@ class Client:
                 return
             clouds = tuple(self._clouds)
         try:
+            child_error: BaseException | None = None
             for cloud in clouds:
-                cloud._close_from_client()
+                try:
+                    cloud._close_from_client()
+                except BaseException as error:
+                    if cloud._close.status != "closed":
+                        raise
+                    if child_error is None:
+                        child_error = error
             self._lease.close()
         except BaseException as error:
             self._close.fail(generation, error)
             raise
-        self._close.succeed(generation)
+        self._close.succeed(generation, child_error)
+        if child_error is not None:
+            raise child_error
 
     def __del__(self) -> None:
         close = getattr(self, "_close", None)
@@ -569,18 +593,27 @@ class CloudStorage:
             replays = tuple(self._replays)
             exports = tuple(self._exports)
         try:
+            child_error: BaseException | None = None
             for request in requests:
                 request.cancel_and_wait()
             for replay in replays:
-                replay._close_from_parent()
+                try:
+                    replay._close_from_parent()
+                except BaseException as error:
+                    if replay._close.status != "closed":
+                        raise
+                    if child_error is None:
+                        child_error = error
             for task in exports:
                 task._close_from_parent()
             _retry_in_use(_native.close, self._handle)
         except BaseException as error:
             self._close.fail(generation, error)
             raise
-        self._close.succeed(generation)
+        self._close.succeed(generation, child_error)
         self._client._finish_cloud(self)
+        if child_error is not None:
+            raise child_error
 
     def __del__(self) -> None:
         close = getattr(self, "_close", None)
@@ -629,6 +662,7 @@ class Replay:
         self._speed = ReplaySpeed.X1
         self._outputs: set[_StorageOutputBase] = set()
         self._tasks: set[RecordingTask] = set()
+        self._dumps: set[RawDump] = set()
         self._close = _CloseCoordinator(self._lock)
         self._native_stopped = False
         self._parent_finished = False
@@ -780,6 +814,23 @@ class Replay:
             task._handle = handle
             return task
 
+    def start_raw_dump(self, options: RawDumpOptions) -> RawDump:
+        _check_process()
+        if not isinstance(options, RawDumpOptions):
+            raise TypeError("options must be RawDumpOptions")
+        self._reject_blocking_callback()
+        with self._operation_lock():
+            self._close.require_open()
+            code, handle = _native.storage_raw_dump_start(
+                self._handle,
+                bytes(options.audio_channel_ids),
+                bytes(options.video_channel_ids),
+            )
+            _check_code(code)
+            dump = RawDump._create(self, handle)
+            self._dumps.add(dump)
+            return dump
+
     def _attach(self, output: _StorageOutputBase) -> object:
         _check_process()
         with self._operation_lock():
@@ -799,6 +850,10 @@ class Replay:
         with self._lock:
             self._tasks.discard(task)
 
+    def _finish_raw_dump(self, dump: RawDump) -> None:
+        with self._lock:
+            self._dumps.discard(dump)
+
     def close(self) -> None:
         _check_process()
         self._close_replay()
@@ -814,7 +869,17 @@ class Replay:
                 return
             outputs = tuple(self._outputs)
             tasks = tuple(self._tasks)
+            dumps = tuple(self._dumps)
         try:
+            raw_dump_error: BaseException | None = None
+            for dump in dumps:
+                try:
+                    dump.close()
+                except BaseException as error:
+                    if not dump._closed:
+                        raise
+                    if raw_dump_error is None:
+                        raw_dump_error = error
             for task in tasks:
                 result = task.stop()
                 result.delete()
@@ -831,7 +896,9 @@ class Replay:
         except BaseException as error:
             self._close.fail(generation, error)
             raise
-        self._close.succeed(generation)
+        self._close.succeed(generation, raw_dump_error)
+        if raw_dump_error is not None:
+            raise raw_dump_error
 
     def __del__(self) -> None:
         close = getattr(self, "_close", None)
@@ -1287,5 +1354,7 @@ __all__ = [
     "RecordingTask",
     "Replay",
     "ReplaySpeed",
+    "RawDump",
+    "RawDumpOptions",
     "VideoOutput",
 ]

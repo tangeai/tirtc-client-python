@@ -191,7 +191,6 @@ _ERROR_TYPES: dict[int, type[TiRTCError]] = {
     6123: UnavailableError,
     6124: StoppedError,
     6125: LogExportError,
-    6126: LogExportError,
     6127: LogUploadError,
     6128: LogUploadError,
     6129: LogUploadError,

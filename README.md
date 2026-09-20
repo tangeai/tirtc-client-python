@@ -11,7 +11,7 @@ SDK 支持两种鉴权模式。External Token 模式面向只持有短期 Token 
 只安装 binary wheel：
 
 ```bash
-python -m pip install --only-binary=:all: tirtc==2.5.0a4
+python -m pip install --only-binary=:all: tirtc==2.5.0
 
 ```
 
@@ -149,4 +149,4 @@ External Token child 遇到 Token 过期时，由应用取得新 Token、调用 
 
 import 不创建线程、目录、网络连接或 Runtime 状态。父进程仅 import 后可以安全 `fork()`；任一 Client 活跃后 fork，子进程首次调用 SDK 会抛 `UnsupportedError(name="forked_process")`。这种子进程必须立即 `exec` 或 `os._exit()`；需要多进程时在 worker 内创建 Client，或使用 `spawn`。
 
-完整程序见 [RTC Example](example/client) 与 [Ti Cloud Storage Example](example/storage)。公开合同见 [RTC API Reference](docs/rtc.md) 和 [Ti Cloud Storage API Reference](docs/ti-cloud-storage.md)。
+完整程序见 [RTC Example](example/client) 与 [Ti Cloud Storage Example](example/storage)。公开合同由本 README、包内类型声明和这两个 canonical Example 共同承接。
