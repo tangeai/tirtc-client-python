@@ -9,4 +9,4 @@
 - Replay/Export 的 pool 排队并执行 Runtime-owned opaque callback task，使用户回调留在 Native generation 与停止屏障内；每个已接受 task 必须执行一次，不能二次排队其用户事件，也不能因 handler 释放而丢弃 task。Replay 自身或关联 Output 回调内的非阻塞操作遇到外部操作占锁时直接返回 `InUseError`。
 - `Client`、`Connection`、Output、`CloudStorage` 与 `Replay` 的 `close()` 幂等。Client 级联关闭自己的 child 并自动 Detach 独立 Output；关联 callback 内会形成自等待的关闭先返回 `InUseError`，不得先做部分 teardown。外部关闭等待 callback barrier，并发调用共享同一次终局。Recording/Export 的终态只由 `stop()` / `wait()` 取得。
 - `example/client/` 与 `example/storage/` 是唯一 canonical Examples，也是 owner real smoke client。测试不得另建私有 acceptance 程序替代它们。
-- `script/build_candidate.sh` 只接受同源 clean-unpack Runtime 输入，`script/python_verify.sh --platform all --mode full` 串行执行两个平台各一条 contract、两种 RTC auth smoke 和两种 Cloud auth smoke，共十条 lane。两种 auth lane 都运行同一个 canonical Example，凭据只从环境变量传入。外部写入按当前用户目标和 owner 工作流执行。`python-test` / `full-test` 合同要求的有界录像上传与日志 roundtrip 属于测试；制品发布、公开仓写入、Samples Push 和测试合同外上传仍须有匹配目标。
+- `script/build_candidate.sh` 只接受同源 clean-unpack Runtime 输入，公开消费者只使用 canonical Example，凭据只从环境变量传入。外部写入按当前用户目标和 owner 工作流执行。`python-test` / `full-test` 合同要求的有界录像上传与日志 roundtrip 属于测试；制品发布、公开仓写入、Samples Push 和测试合同外上传仍须有匹配目标。

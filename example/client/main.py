@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from contextlib import ExitStack
 import json
 from datetime import timedelta
@@ -8,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import secrets
 import sys
 import threading
 import time
@@ -60,6 +62,71 @@ class Signals:
                 self._condition.wait(remaining)
 
 
+class MessageProof:
+    """Exact application bytes; the private stream fixture is explicitly selected."""
+    PREFIX = b"tirtc-stream-v1\0"
+
+    def __init__(self, stream_ids: list[int], fixture: bool) -> None:
+        nonce = secrets.token_bytes(16)
+        self.fixture = fixture
+        self._condition = threading.Condition()
+        self._failure: str | None = None
+        self.commands = [(command, nonce + bytes((index, 0, 255, 128)))
+                         for index, command in enumerate((0x2001, 0xFFFFFFFF))]
+        self.streams = [(stream_ids[index % len(stream_ids)], timestamp,
+                         self.PREFIX + b"\0" + nonce + index.to_bytes(4, "big") + b"\0\xff\x80")
+                        for index, timestamp in enumerate((0, 0xFFFFFFFF))]
+        self.received_commands: list[tuple[int, bytes]] = []
+        self.received_streams: list[tuple[int, int, bytes]] = []
+
+    def command(self, command: int, data: bytes) -> None:
+        with self._condition:
+            index = len(self.received_commands)
+            if index >= len(self.commands) or (command, data) != self.commands[index]:
+                self._failure = "command ID/order/binary mismatch"
+            self.received_commands.append((command, data))
+            self._condition.notify_all()
+
+    def stream(self, stream: int, timestamp: timedelta, data: bytes) -> None:
+        if not self.fixture:
+            return
+        # The normal peer's periodic epoch message is unrelated to this exchange.
+        if not data.startswith(self.PREFIX):
+            return
+        with self._condition:
+            index = len(self.received_streams)
+            actual = (stream, round(timestamp.total_seconds() * 1000), data)
+            if index >= len(self.streams):
+                self._failure = "duplicate stream response"
+            else:
+                stream_id, stamp, request = self.streams[index]
+                expected = (stream_id, stamp, self.PREFIX + b"\1" + request[len(self.PREFIX) + 1:])
+                if actual != expected:
+                    self._failure = "stream ID/timestamp/order/binary mismatch"
+            self.received_streams.append(actual)
+            self._condition.notify_all()
+
+    def wait(self, deadline: float) -> None:
+        with self._condition:
+            while True:
+                if self._failure:
+                    raise RuntimeError(self._failure)
+                if len(self.received_commands) == len(self.commands) and (
+                    not self.fixture or len(self.received_streams) == len(self.streams)):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("message acceptance did not become exact remote delivery")
+                self._condition.wait(remaining)
+
+    def evidence(self) -> dict[str, object]:
+        self.wait(time.monotonic())
+        return {"status": "passed", "peer_mode": "stream-echo" if self.fixture else "device",
+                "commands": [{"id": item[0], "bytes_hex": item[1].hex()} for item in self.received_commands],
+                "streams": [{"id": item[0], "timestamp_ms": item[1], "bytes_hex": item[2].hex()}
+                            for item in self.received_streams]}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Receive RTC media with the public tirtc package."
@@ -96,6 +163,7 @@ def parse_args() -> argparse.Namespace:
         help="run one registered raw dump RTC case through this public Example",
     )
     parser.add_argument("--timeout", type=float, default=90.0, help="overall timeout in seconds")
+    parser.add_argument("--verify-message-echo", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.case_id is not None:
         args.raw_dump = True
@@ -135,7 +203,8 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def save_temporary_media(source: Path, destination: Path, signature: bytes, offset: int) -> None:
+def save_temporary_media(media: tirtc.RecordingFile | tirtc.SnapshotFile, destination: Path, signature: bytes, offset: int) -> None:
+    source = media.path
     size = source.stat().st_size
     if size <= offset + len(signature) or size > MAXIMUM_MEDIA_FILE_SIZE:
         raise RuntimeError(f"unexpected temporary media size: {source} ({size} bytes)")
@@ -145,6 +214,17 @@ def save_temporary_media(source: Path, destination: Path, signature: bytes, offs
             raise RuntimeError(f"unexpected temporary media signature: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
+    digest = hashlib.sha256()
+    with destination.open("rb") as saved:
+        for chunk in iter(lambda: saved.read(1024 * 1024), b""):
+            digest.update(chunk)
+    media.delete()
+    if source.exists():
+        raise RuntimeError("SDK temporary media remains after delete")
+    destination.with_suffix(destination.suffix + ".receipt.json").write_text(json.dumps({
+        "source_path": str(source), "deleted": True, "sha256": digest.hexdigest(),
+        "bytes": size, "saved_name": destination.name,
+    }, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def run() -> None:
@@ -170,8 +250,7 @@ def run() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + args.timeout
     signals = Signals()
-    command_received = threading.Event()
-    message_received = threading.Event()
+    messages = MessageProof(args.video_stream_ids or [args.audio_stream_id or 0], args.verify_message_echo)
 
     def on_state(state: tirtc.ConnectionState, error: tirtc.TiRTCError | None) -> None:
         del state
@@ -200,8 +279,8 @@ def run() -> None:
         connection = stack.enter_context(
             client.create_connection(
                 on_state_changed=on_state,
-                on_command=lambda command_id, data: command_received.set(),
-                on_stream_message=lambda stream_id, timestamp, data: message_received.set(),
+                on_command=messages.command,
+                on_stream_message=messages.stream,
             )
         )
         audio: tirtc.AudioOutput | None = None
@@ -252,6 +331,13 @@ def run() -> None:
             stack.callback(encoded_video.close)
             video.attach(connection, stream_id)
             encoded_video.attach(connection, stream_id)
+            try:
+                early_snapshot = video.take_snapshot()
+            except tirtc.NoFrameError:
+                pass
+            else:
+                early_snapshot.delete()
+                raise RuntimeError("zero-frame snapshot unexpectedly succeeded")
             video_outputs.append((stream_id, video, encoded_video))
         if args.auth_mode == "external-token":
             connection.connect(
@@ -297,6 +383,32 @@ def run() -> None:
                 raise TimeoutError("raw dump duration exceeds the remaining example timeout")
         if required_frames:
             signals.wait_after(tuple(required_frames), {}, deadline)
+        route_evidence: dict[str, object] = {"zero_frame_rejected": [item[0] for item in video_outputs]}
+        if len(video_outputs) >= 2:
+            first_id, first_video, first_encoded = video_outputs[0]
+            second_id = video_outputs[1][0]
+            route_names = (f"video:{first_id}", f"encoded_video:{first_id}",
+                           f"video:{second_id}", f"encoded_video:{second_id}")
+            common_before = signals.snapshot(route_names)
+            signals.wait_after(route_names, common_before, deadline)
+            common_after = signals.snapshot(route_names)
+            first_encoded.detach()
+            first_video.detach()
+            isolated_before = signals.snapshot(route_names)
+            signals.wait_after(route_names[2:], isolated_before, deadline)
+            isolated_after = signals.snapshot(route_names)
+            if any(isolated_after[name] != isolated_before[name] for name in route_names[:2]):
+                raise RuntimeError("detached route continued to deliver callbacks")
+            first_video.attach(connection, first_id)
+            first_encoded.attach(connection, first_id)
+            restored_before = signals.snapshot(route_names)
+            connection.request_video_keyframe(first_id)
+            signals.wait_after(route_names, restored_before, deadline)
+            route_evidence.update(status="passed", ids=[first_id, second_id],
+                common_before=common_before, common_after=common_after,
+                isolated_before=isolated_before, isolated_after=isolated_after,
+                restored_before=restored_before, restored_after=signals.snapshot(route_names))
+        (args.output_dir / "route-proof.json").write_text(json.dumps(route_evidence, sort_keys=True) + "\n")
 
         if dump is not None:
             time.sleep(max(0, capture_deadline - time.monotonic()))
@@ -343,7 +455,7 @@ def run() -> None:
                     time.sleep(remaining)
                 with recording.stop() as recording_file:
                     save_temporary_media(
-                        recording_file.path,
+                        recording_file,
                         args.output_dir / f"rtc-recording-stream-{stream_id}.mp4",
                         b"ftyp",
                         4,
@@ -356,23 +468,19 @@ def run() -> None:
                 raise
             with video.take_snapshot() as snapshot:
                 save_temporary_media(
-                    snapshot.path,
+                    snapshot,
                     args.output_dir / f"rtc-snapshot-stream-{stream_id}.jpg",
                     b"\xff\xd8",
                     0,
                 )
             print(f"consumed video stream {stream_id}")
 
-        connection.send_command(0x2001, b"python-client-command")
-        timestamp = timedelta(milliseconds=int(time.time() * 1000) & 0xFFFFFFFF)
-        message_stream_id = args.video_stream_ids[0] if args.video_stream_ids else (
-            args.audio_stream_id if args.audio_stream_id is not None else 0
-        )
-        connection.send_stream_message(message_stream_id, timestamp, b"python-client-message")
-        if not command_received.wait(max(0, deadline - time.monotonic())):
-            raise TimeoutError("timed out waiting for remote command")
-        if not message_received.wait(max(0, deadline - time.monotonic())):
-            raise TimeoutError("timed out waiting for remote stream message")
+        for command_id, payload in messages.commands:
+            connection.send_command(command_id, payload)
+        if messages.fixture:
+            for stream_id, stamp, payload in messages.streams:
+                connection.send_stream_message(stream_id, timedelta(milliseconds=stamp), payload)
+        messages.wait(deadline)
         if args.upload_logs:
             print(json.dumps({"log_id": client.upload_logs()}, sort_keys=True))
 
@@ -386,6 +494,7 @@ def run() -> None:
             encoded_audio.detach()
             audio.detach()
         connection.disconnect()
+    (args.output_dir / "message-proof.json").write_text(json.dumps(messages.evidence(), sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

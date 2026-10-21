@@ -97,7 +97,9 @@ response_id,range_offset,archive_offset,length,http_status,result
 A `bytes` row maps an original object range to its contiguous offset in `object.part`. An `ok` or
 `error:<TiError>` row summarizes one HTTP response. The final response ID `0` row records the
 attempt result and total evidence bytes as `complete`, `partial`, or `error:<TiError>`. `partial`
-means the download succeeded but capture began after an earlier object range. For a complete attempt, successful response summaries
+means the capture window did not contain the whole object; it may have started after an earlier
+range or ended during the final response. In the latter case, a `capture_window` attempt may have
+bytes for one final response without its response summary. For a complete attempt, successful response summaries
 must cover the object from offset zero through `expected_size` without holes or overrun; the
 assembled `object.tstr` must match its declared size and SHA-256. `received_bytes` can exceed the
 object size when retries overlap. The manifest also relates objects, parsed records, read epochs,
@@ -149,53 +151,20 @@ Timestamps may be negative, repeat, or move backwards. They are not a cross-stag
 `far_volume` is the actual integer percent (0 through 100) supplied with a `render_reference`
 record; it is empty for all other stages.
 
-## Offline tool
+## Diagnostic consumer
 
-The repository tool uses only the Python standard library for archive inspection, verification,
-safe unpacking, and packet extraction:
+DevTools is the public consumer for archive inspection,
+verification, packet extraction, conversion and bounded media analysis. Its
+usage reference defines command options, execution status,
+artifacts and external-tool requirements. The npm package carries its own readers and
+format assets; Runtime packages and public API Samples do not project diagnostic readers.
 
-In the TiRTC source repository it is `script/logging/raw_dump.py`; the public API Samples and
-installed Runtime projection place the same file at `tools/raw-dump/raw_dump.py`.
+Conversion writes a separate playback artifact and preserves the original archive. Raw AAC
+requires observed AudioSpecificConfig or explicit caller configuration; unknown framing
+cannot be inferred from codec configuration. PCM conversion uses the declared rate and
+channels. TSTR inspection consumes a key file and does not include that key in its report.
 
-```sh
-python3 script/logging/raw_dump.py inspect raw-dump.zip
-python3 script/logging/raw_dump.py verify raw-dump.zip
-python3 script/logging/raw_dump.py extract-packet raw-dump.zip --capture-seq 42 --output packet.bin
-python3 script/logging/raw_dump.py unpack raw-dump.zip .build/raw-dump/unpacked
-```
-
-`convert` creates a separate elementary playback file and a JSON report. It never changes the raw
-archive. H.264 and H.265 remain Annex B elementary streams. ADTS AAC is copied. Raw AAC access units
-are framed only when the archive contains an observed AudioSpecificConfig or the caller explicitly
-provides one. A segment whose framing is `unknown` is rejected even when a codec configuration is
-provided, because configuration does not establish how the captured bytes are framed.
-
-```sh
-python3 script/logging/raw_dump.py convert raw-dump.zip \
-  --stream audio-13 --segment 0001 --output .build/raw-dump/audio.aac
-```
-
-For v2 uplink, select `uplink-audio-<id>` and a manifest stage. PCM conversion wraps the original
-s16le bytes in a separate WAV file using the declared rate and channels; it does not alter the
-archive. Encoded conversion follows the same codec/framing rules as downlink data.
-
-```sh
-python3 script/logging/raw_dump.py convert raw-dump.zip \
-  --stream uplink-audio-14 --stage captured --segment 1 \
-  --output .build/raw-dump/uplink-captured.wav
-
-python3 script/logging/raw_dump_check.py raw-dump.zip \
-  --stream uplink-audio-14 --stage encoded --output-dir .build/raw-dump/encoded-check
-```
-
-`inspect-tstr` can independently decrypt and summarize an original TSTR object with an installed
-OpenSSL EVP provider, or the optional Python `cryptography` package. The 16-byte AES key must come
-from a file or standard input. It is never accepted as a command-line value and is not written to
-the report or archive.
-
-```sh
-python3 script/logging/raw_dump.py inspect-tstr --input object.tstr --key-file recording.key
-```
-
-Raw dumps may contain customer media. Applications control copying and sharing. TiRTC does not put
-access keys, secret keys, tokens, signed URL queries, or decryption keys in the archive.
+Decoded media and a valid archive prove only the captured bytes and named observation points.
+They do not prove physical presentation, audio quality or a root cause. Raw dumps may contain
+customer media; applications control copying and sharing. The writer does not record access
+keys, secret keys, tokens, signed URL queries or decryption keys.
