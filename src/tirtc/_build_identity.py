@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import threading
 
-RELEASE_VERSION = '2.6.0-alpha.3'
-BUILD_TIME_UTC = '2026-10-22T18:51:50Z'
-SOURCE_REVISION = '3e607aa93bb48c47bff3dcd1e16ad20cba01eeb4'
+RELEASE_VERSION = '2.6.0-alpha.4'
+BUILD_TIME_UTC = '2026-10-22T21:43:59Z'
+SOURCE_REVISION = 'dc3279ec7771c4cc455cc070da128b4df387da31'
 SOURCE_DIRTY = 0
 
 _lock = threading.Lock()
