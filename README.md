@@ -11,7 +11,7 @@ SDK 支持两种鉴权模式。External Token 模式面向只持有短期 Token 
 只安装 binary wheel：
 
 ```bash
-python -m pip install --only-binary=:all: tirtc==2.6.0a2
+python -m pip install --only-binary=:all: tirtc==2.6.0a3
 
 ```
 
