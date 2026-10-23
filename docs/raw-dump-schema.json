@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tange.ai/schemas/tirtc/raw-dump.schema.json",
-  "title": "TiRTC Raw Dump Manifest v1/v2",
+  "title": "TiRTC Raw Dump Manifest v1/v2/v3",
   "type": "object",
   "required": [
     "format", "version", "capture_id", "source_kind", "observation_point",
@@ -12,7 +12,7 @@
   ],
   "properties": {
     "format": { "const": "tirtc.raw-dump" },
-    "version": { "enum": [1, 2] },
+    "version": { "enum": [1, 2, 3] },
     "capture_id": { "type": "string", "minLength": 1 },
     "source_kind": { "enum": ["rtc", "cloud_storage"] },
     "observation_point": { "type": "string", "minLength": 1 },
@@ -72,6 +72,27 @@
             }
           },
           "streams": { "items": { "$ref": "#/$defs/streamV2" } },
+          "objects": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "version": { "const": 3 } } },
+      "then": {
+        "properties": {
+          "source_kind": { "const": "rtc" },
+          "selected_sources": {
+            "items": { "$ref": "#/$defs/selectedV2" },
+            "contains": {
+              "type": "object",
+              "required": ["media_kind", "direction"],
+              "properties": { "media_kind": { "const": "audio" }, "direction": { "const": "uplink" } }
+            }
+          },
+          "streams": {
+            "items": { "$ref": "#/$defs/streamV3" },
+            "contains": { "$ref": "#/$defs/uplinkStreamV3WithMicrophone" }
+          },
           "objects": { "maxItems": 0 }
         }
       }
@@ -175,6 +196,10 @@
         "source_instance_id": { "$ref": "#/$defs/decimal" },
         "record_count": { "$ref": "#/$defs/decimal" },
         "byte_count": { "$ref": "#/$defs/decimal" },
+        "input_source": { "enum": ["built_in_capture", "submitted", "custom_microphone"] },
+        "input_mode": { "enum": ["built_in", "custom"] },
+        "capture_enabled": { "type": "boolean" },
+        "input_generation": { "$ref": "#/$defs/decimal" },
         "format": { "$ref": "#/$defs/pcmFormat" },
         "data": { "$ref": "#/$defs/file" },
         "index": { "$ref": "#/$defs/file" }
@@ -203,7 +228,7 @@
         }
       ]
     },
-    "uplinkStage": {
+    "uplinkStageV2": {
       "type": "object",
       "required": ["stage", "segments"],
       "properties": {
@@ -217,6 +242,45 @@
       }],
       "additionalProperties": true
     },
+    "uplinkStageV3": {
+      "type": "object",
+      "required": ["stage", "segments"],
+      "properties": {
+        "stage": { "enum": ["microphone", "captured", "render_reference", "processed", "encoded"] },
+        "segments": { "type": "array", "minItems": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "stage": { "const": "encoded" } } },
+          "then": { "properties": { "segments": { "items": { "$ref": "#/$defs/encodedUplinkSegment" } } } },
+          "else": { "properties": { "segments": { "items": { "$ref": "#/$defs/pcmUplinkSegment" } } } }
+        },
+        {
+          "if": { "properties": { "stage": { "const": "microphone" } } },
+          "then": {
+            "properties": {
+              "segments": {
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/pcmUplinkSegment" },
+                    {
+                      "type": "object",
+                      "required": ["input_source", "input_mode", "capture_enabled", "input_generation"],
+                      "properties": {
+                        "input_source": { "const": "custom_microphone" },
+                        "input_mode": { "const": "custom" },
+                        "capture_enabled": { "const": true }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
     "uplinkStreamV2": {
       "type": "object",
       "required": ["media_kind", "direction", "source_id", "stages"],
@@ -224,12 +288,42 @@
         "media_kind": { "const": "audio" },
         "direction": { "const": "uplink" },
         "source_id": { "type": "integer", "minimum": 0, "maximum": 15 },
-        "stages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/uplinkStage" } }
+        "stages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/uplinkStageV2" } }
       },
       "additionalProperties": true
     },
     "streamV2": {
       "oneOf": [{ "$ref": "#/$defs/downlinkStreamV2" }, { "$ref": "#/$defs/uplinkStreamV2" }]
+    },
+    "uplinkStreamV3": {
+      "type": "object",
+      "required": ["media_kind", "direction", "source_id", "stages"],
+      "properties": {
+        "media_kind": { "const": "audio" },
+        "direction": { "const": "uplink" },
+        "source_id": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "stages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/uplinkStageV3" } }
+      },
+      "additionalProperties": true
+    },
+    "uplinkStreamV3WithMicrophone": {
+      "allOf": [
+        { "$ref": "#/$defs/uplinkStreamV3" },
+        {
+          "properties": {
+            "stages": {
+              "contains": {
+                "type": "object",
+                "required": ["stage"],
+                "properties": { "stage": { "const": "microphone" } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "streamV3": {
+      "oneOf": [{ "$ref": "#/$defs/downlinkStreamV2" }, { "$ref": "#/$defs/uplinkStreamV3" }]
     },
     "object": {
       "type": "object",
